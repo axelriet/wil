@@ -1812,8 +1812,9 @@ inline HRESULT GetFailureLogString(
             break;
         }
 
-        wchar_t szErrorText[256]{};
         LONG errorCode = 0;
+        wchar_t szErrorText[256];
+        szErrorText[0] = L'\0';
 
         if (WI_IsFlagSet(failure.flags, FailureFlags::NtStatus))
         {
@@ -1836,7 +1837,7 @@ inline HRESULT GetFailureLogString(
                 nullptr);
         }
 
-        // %FILENAME(%LINE): %TYPE(%count) tid(%threadid) %HRESULT %SystemMessage
+        // %FILENAME(%LINE): %TYPE(%count) tid(%threadid) 0x%HRESULT %SystemMessage
         //     %Caller_MSG [%CODE(%FUNCTION)]
 
         PWSTR dest = pszDest;
@@ -1845,24 +1846,27 @@ inline HRESULT GetFailureLogString(
         if (failure.pszFile != nullptr)
         {
             dest = details::LogStringPrintf(
-                dest, destEnd, L"%hs(%u) %hs!%p: ", failure.pszFile, failure.uLineNumber, failure.pszModule, failure.returnAddress);
+                dest, destEnd, L"%hs(%u): [%hs!%p] ", failure.pszFile, failure.uLineNumber, failure.pszModule, failure.returnAddress);
         }
         else
         {
-            dest = details::LogStringPrintf(dest, destEnd, L"%hs!%p: ", failure.pszModule, failure.returnAddress);
+            dest = details::LogStringPrintf(dest, destEnd, L"[%hs!%p] ", failure.pszModule, failure.returnAddress);
         }
 
         if (failure.callerReturnAddress != nullptr)
         {
-            dest = details::LogStringPrintf(dest, destEnd, L"(caller: %p) ", failure.callerReturnAddress);
+            dest = details::LogStringPrintf(dest, destEnd, L"[caller: %p] ", failure.callerReturnAddress);
         }
 
         dest = details::LogStringPrintf(
-            dest, destEnd, L"%hs(%d) tid(%x) 0x%08x %ws", pszType, failure.cFailureCount, ::GetCurrentThreadId(), errorCode, szErrorText);
+            dest, destEnd, L"%hs(%d) tid(%x) 0x%08X %ws", pszType, failure.cFailureCount, ::GetCurrentThreadId(), errorCode, szErrorText);
 
         if ((failure.pszMessage != nullptr) || (failure.pszCallContext != nullptr) || (failure.pszFunction != nullptr))
         {
-            dest = details::LogStringPrintf(dest, destEnd, L" ");
+            if (szErrorText[0])
+            {
+                dest = details::LogStringPrintf(dest, destEnd, L" ");
+            }
             if (failure.pszMessage != nullptr)
             {
                 dest = details::LogStringPrintf(dest, destEnd, L"Msg:[%ws] ", failure.pszMessage);
