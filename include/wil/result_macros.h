@@ -1845,7 +1845,7 @@ inline HRESULT GetFailureLogString(
         if (failure.pszFile != nullptr)
         {
             dest = details::LogStringPrintf(
-                dest, destEnd, L"%hs(%u)\\%hs!%p: ", failure.pszFile, failure.uLineNumber, failure.pszModule, failure.returnAddress);
+                dest, destEnd, L"%hs(%u) %hs!%p: ", failure.pszFile, failure.uLineNumber, failure.pszModule, failure.returnAddress);
         }
         else
         {
@@ -1858,11 +1858,11 @@ inline HRESULT GetFailureLogString(
         }
 
         dest = details::LogStringPrintf(
-            dest, destEnd, L"%hs(%d) tid(%x) %08X %ws", pszType, failure.cFailureCount, ::GetCurrentThreadId(), errorCode, szErrorText);
+            dest, destEnd, L"%hs(%d) tid(%x) 0x%08x %ws", pszType, failure.cFailureCount, ::GetCurrentThreadId(), errorCode, szErrorText);
 
         if ((failure.pszMessage != nullptr) || (failure.pszCallContext != nullptr) || (failure.pszFunction != nullptr))
         {
-            dest = details::LogStringPrintf(dest, destEnd, L"    ");
+            dest = details::LogStringPrintf(dest, destEnd, L" ");
             if (failure.pszMessage != nullptr)
             {
                 dest = details::LogStringPrintf(dest, destEnd, L"Msg:[%ws] ", failure.pszMessage);
@@ -1874,15 +1874,15 @@ inline HRESULT GetFailureLogString(
 
             if (failure.pszCode != nullptr)
             {
-                dest = details::LogStringPrintf(dest, destEnd, L"[%hs(%hs)]\n", failure.pszFunction, failure.pszCode);
+                dest = details::LogStringPrintf(dest, destEnd, L"[%hs(%hs)]\r\n", failure.pszFunction, failure.pszCode);
             }
             else if (failure.pszFunction != nullptr)
             {
-                dest = details::LogStringPrintf(dest, destEnd, L"[%hs]\n", failure.pszFunction);
+                dest = details::LogStringPrintf(dest, destEnd, L"[%hs]\r\n", failure.pszFunction);
             }
             else
             {
-                dest = details::LogStringPrintf(dest, destEnd, L"\n");
+                dest = details::LogStringPrintf(dest, destEnd, L"\r\n");
             }
         }
     }
