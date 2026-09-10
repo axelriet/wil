@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 #include <utility>
-#if _HAS_CXX17
+#if (__WI_LIBCPP_STD_VER >= 17) && WI_HAS_INCLUDE(<string_view>, 1) // Assume present if C++17
 #include <string_view>
 #endif
 
@@ -132,18 +132,68 @@ inline PCWSTR str_raw_ptr(const std::wstring& str)
     return str.c_str();
 }
 
-#if _HAS_CXX17
+#if __cpp_lib_string_view >= 201606L
+
+#if defined(__WIL_OLEAUTO_H_)
+// Create wil::unique_bstr from std::wstring_view (regardless if not null terminated, or if it contains embedded nulls)
+inline wil::unique_bstr make_bstr_nothrow(std::wstring_view source) noexcept
+{
+    if (source.size() > 0xffffffffUL /*UINT32_MAX*/)
+    {
+        return wil::unique_bstr{};
+    }
+    return wil::unique_bstr(::SysAllocStringLen(source.data(), static_cast<UINT>(source.size())));
+}
+inline wil::unique_bstr make_bstr_failfast(std::wstring_view source) noexcept
+{
+    auto result(make_bstr_nothrow(source));
+    FAIL_FAST_IF_NULL_ALLOC(result);
+    return result;
+}
+#ifdef WIL_ENABLE_EXCEPTIONS
+inline wil::unique_bstr make_bstr(std::wstring_view source)
+{
+    wil::unique_bstr result(make_bstr_nothrow(source));
+    THROW_IF_NULL_ALLOC(result);
+    return result;
+}
+#endif // WIL_ENABLE_EXCEPTIONS
+#endif // defined(__WIL_OLEAUTO_H_)
+
 /**
     zstring_view. A zstring_view is identical to a std::string_view except it is always nul-terminated (unless empty).
     * zstring_view can be used for storing string literals without "forgetting" the length or that it is nul-terminated.
     * A zstring_view can be converted implicitly to a std::string_view because it is always safe to use a nul-terminated
       string_view as a plain string view.
     * A zstring_view can be constructed from a std::string because the data in std::string is nul-terminated.
+    * substr(pos) returns a zstring_view because the tail remains nul-terminated. substr(pos, count) returns a
+      std::string_view because an arbitrary slice may not be nul-terminated.
+    * contains() is available before C++23 through a compatibility implementation.
 */
 template <class TChar>
 class basic_zstring_view : public std::basic_string_view<TChar>
 {
     using size_type = typename std::basic_string_view<TChar>::size_type;
+
+    template <typename T>
+    struct has_c_str
+    {
+        template <typename U>
+        static auto test(int) -> decltype(std::declval<U>().c_str(), std::true_type());
+        template <typename U>
+        static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(0))::value;
+    };
+
+    template <typename T>
+    struct has_size
+    {
+        template <typename U>
+        static auto test(int) -> decltype(std::declval<U>().size() == 1, std::true_type());
+        template <typename U>
+        static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(0))::value;
+    };
 
 public:
     constexpr basic_zstring_view() noexcept = default;
@@ -177,6 +227,16 @@ public:
     {
     }
 
+    template <typename TSrc, std::enable_if_t<has_c_str<TSrc>::value && has_size<TSrc>::value && std::is_same_v<typename TSrc::value_type, TChar>>* = nullptr>
+    constexpr basic_zstring_view(TSrc const& src) noexcept : std::basic_string_view<TChar>(src.c_str(), src.size())
+    {
+    }
+
+    template <typename TSrc, std::enable_if_t<has_c_str<TSrc>::value && !has_size<TSrc>::value && std::is_same_v<typename TSrc::value_type, TChar>>* = nullptr>
+    constexpr basic_zstring_view(TSrc const& src) noexcept : std::basic_string_view<TChar>(src.c_str())
+    {
+    }
+
     // basic_string_view [] precondition won't let us read view[view.size()]; so we define our own.
     WI_NODISCARD constexpr const TChar& operator[](size_type idx) const noexcept
     {
@@ -188,6 +248,36 @@ public:
     {
         WI_ASSERT(this->data() == nullptr || this->data()[this->size()] == 0);
         return this->data();
+    }
+
+    // contains() backport for builds below C++23. Compiles out once the STL provides
+    // basic_string_view::contains natively.
+#if !defined(__cpp_lib_string_contains) || __cpp_lib_string_contains < 202011L
+    WI_NODISCARD constexpr bool contains(std::basic_string_view<TChar> view) const noexcept
+    {
+        return this->find(view) != this->npos;
+    }
+
+    WI_NODISCARD constexpr bool contains(TChar value) const noexcept
+    {
+        return this->find(value) != this->npos;
+    }
+
+    WI_NODISCARD constexpr bool contains(const TChar* value) const
+    {
+        return this->find(value) != this->npos;
+    }
+#endif
+
+    WI_NODISCARD constexpr basic_zstring_view substr(size_type pos = 0) const
+    {
+        const auto tail = std::basic_string_view<TChar>(*this).substr(pos);
+        return tail.data() == nullptr ? basic_zstring_view{} : basic_zstring_view{tail.data(), tail.size()};
+    }
+
+    WI_NODISCARD constexpr std::basic_string_view<TChar> substr(size_type pos, size_type count) const
+    {
+        return std::basic_string_view<TChar>(*this).substr(pos, count);
     }
 
 private:
@@ -211,22 +301,134 @@ private:
 using zstring_view = basic_zstring_view<char>;
 using zwstring_view = basic_zstring_view<wchar_t>;
 
+// str_raw_ptr is an overloaded function that retrieves a const pointer to the first character in a string's buffer.
+// This is the overload for std::wstring.  Other overloads available in resource.h.
+template <typename TChar>
+inline auto str_raw_ptr(basic_zstring_view<TChar> str)
+{
+    return str.c_str();
+}
+
+namespace details
+{
+    template <std::size_t N>
+    struct wchar_literal_storage
+    {
+        static constexpr const std::size_t size = N;
+        wchar_t value[N];
+        constexpr wchar_literal_storage(const wchar_t (&str)[N]) WI_NOEXCEPT
+        {
+            std::copy_n(str, N, value);
+        }
+    };
+
+    template <std::size_t N>
+    wchar_literal_storage(const wchar_t (&)[N]) -> wchar_literal_storage<N>;
+} // namespace details
+
 inline namespace literals
 {
-    constexpr zstring_view operator"" _zv(const char* str, std::size_t len) noexcept
+#if __WI_LIBCPP_STD_VER >= 20
+    template <wil::details::wchar_literal_storage Str>
+    struct bstr_storage_t
     {
-        return zstring_view(str, len);
+        uint32_t sizeBytes = static_cast<uint32_t>((Str.size - 1) * sizeof(wchar_t));
+        decltype(Str) string{Str};
+    };
+
+    /**
+        A statically-allocated, BSTR-shaped literal: a length-prefixed wide string whose data pointer is a valid
+        BSTR (usable with SysStringLen, SysStringByteLen, wcslen). No heap allocation; size is the literal's exact
+        length. Lifetime is tied to the literal object itself.
+
+        Example:
+            void Use(BSTR);
+            Use(L"foo"_bstr);
+    */
+    template <wil::details::wchar_literal_storage Lit>
+    WI_NODISCARD constexpr auto operator""_bstr() WI_NOEXCEPT
+    {
+        constexpr static const bstr_storage_t<Lit> storage{};
+        static_assert(sizeof(storage.sizeBytes) == 4);
+        static_assert(offsetof(decltype(storage), sizeBytes) == 0);
+        static_assert(offsetof(decltype(storage), string) == sizeof(uint32_t));
+        static_assert(offsetof(decltype(storage), string.value) == sizeof(uint32_t));
+        return const_cast<wchar_t*>(storage.string.value);
     }
 
-    constexpr zwstring_view operator"" _zv(const wchar_t* str, std::size_t len) noexcept
+#endif // __WI_LIBCPP_STD_VER >= 20
+
+    constexpr zstring_view operator""_zv(const char* str, std::size_t len) noexcept
     {
-        return zwstring_view(str, len);
+        return {str, len};
+    }
+
+    constexpr zwstring_view operator""_zv(const wchar_t* str, std::size_t len) noexcept
+    {
+        return {str, len};
     }
 } // namespace literals
 
-#endif // _HAS_CXX17
+#endif // __cpp_lib_string_view >= 201606L
+
+#if __WI_LIBCPP_STD_VER >= 17
+// This is a helper that allows one to construct a functor that has an overloaded operator()
+// composed from the operator()s of multiple lambdas. It is most useful as the "visitor" for a
+// std::visit call on a std::variant. A lambda for each type in the variant, and optionally one
+// generic lambda, can be provided to perform compile time visitation of the std::variant.
+//
+// Example:
+//        std::variant<int, bool, double, void*> theVariant;
+//        std::visit(wil::overloaded{
+//           [](int theInt)
+//           {
+//                // Handle int.
+//           },
+//           [](double theDouble)
+//           {
+//                // Handle double.
+//           },
+//           [](auto boolOrVoidPtr)
+//           {
+//                // This will receive all the remaining types. Alternatively, handle each type with
+//                // a lambda that accepts that type. If all types are not handled, you get a
+//                // compile-time error, which makes std::visit superior to an if-else ladder that
+//                // tries to handle each type in the variant.
+//           }},
+//           theVariant);
+//
+template <typename... T>
+struct overloaded final : T...
+{
+    using T::operator()...;
+
+    // This allows one to use the () syntax to construct the visitor, instead of {}. Both are
+    // equivalent, and the choice ultimately boils down to preference of style.
+    template <typename... Fs>
+    constexpr explicit overloaded(Fs&&... fs) : T{std::forward<Fs>(fs)}...
+    {
+    }
+};
+
+// Deduction guide to aid CTAD.
+template <typename... T>
+overloaded(T...) -> overloaded<T...>;
+
+#endif // __WI_LIBCPP_STD_VER >= 17
 
 } // namespace wil
+
+// This suppression is a temporary workaround to allow libraries built with C++20 to link into binaries built with
+// earlier standard versions such as C++17. This appears to be an issue even when this specialization goes unused
+#ifndef WIL_SUPPRESS_STD_FORMAT_USE
+#if (__WI_LIBCPP_STD_VER >= 20) && WI_HAS_INCLUDE(<format>, 1) // Assume present if C++20
+#include <format>
+template <typename TChar>
+struct std::formatter<wil::basic_zstring_view<TChar>, TChar> : std::formatter<std::basic_string_view<TChar>, TChar>
+{
+};
+#endif
+#endif
 
 #endif // WIL_ENABLE_EXCEPTIONS
 

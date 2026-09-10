@@ -169,6 +169,92 @@ namespace reg
     }
 #endif // #define __WIL_WINREG_STL
 
+#if defined(WIL_ENABLE_EXCEPTIONS)
+    /**
+     * @brief Deletes the specified value from under an open or well-known registry key - see RegDeleteKeyValueW
+     * @param key An open or well-known registry key
+     * @param subKey The name of the subkey to append to `key`.
+     *        If `nullptr`, then the value is deleted from `key` directly.
+     * @param value_name The name of the registry value to delete.
+     *        Can be nullptr to delete the unnamed default registry value.
+     * @exception std::exception (including wil::ResultException) will be thrown on all failures
+     */
+    inline void delete_value(HKEY key, _In_opt_ PCWSTR subKey, _In_opt_ PCWSTR value_name)
+    {
+        const reg_view_details::reg_view regview{key};
+        regview.delete_value(subKey, value_name);
+    }
+
+    /**
+     * @brief Deletes the specified value from under an open or well-known registry key - see RegDeleteValueW
+     * @param key An open or well-known registry key
+     * @param value_name The name of the registry value to delete.
+     *        Can be nullptr to delete the unnamed default registry value.
+     * @exception std::exception (including wil::ResultException) will be thrown on all failures
+     */
+    inline void delete_value(HKEY key, _In_opt_ PCWSTR value_name)
+    {
+        const reg_view_details::reg_view regview{key};
+        regview.delete_value(value_name);
+    }
+
+    /**
+     * @brief Recursively deletes the specified subkey, its values, and all of its descendant subkeys - see RegDeleteTreeW
+     * @param key An open or well-known registry key
+     * @param subKey The name of the subkey to delete (relative to `key`).
+     *        If `nullptr`, then the subkeys and values of `key` are deleted, but `key` itself is not.
+     * @remark Succeeds (does nothing) if the specified subkey does not exist - see wil::reg::is_registry_not_found
+     * @exception std::exception (including wil::ResultException) will be thrown on all failures
+     */
+    inline void delete_tree(HKEY key, _In_opt_ PCWSTR subKey)
+    {
+        const reg_view_details::reg_view regview{key};
+        regview.delete_tree(subKey);
+    }
+#endif // #if defined(WIL_ENABLE_EXCEPTIONS)
+
+    /**
+     * @brief Deletes the specified value from under an open or well-known registry key - see RegDeleteKeyValueW
+     * @param key An open or well-known registry key
+     * @param subKey The name of the subkey to append to `key`.
+     *        If `nullptr`, then the value is deleted from `key` directly.
+     * @param value_name The name of the registry value to delete.
+     *        Can be nullptr to delete the unnamed default registry value.
+     * @return HRESULT error code indicating success or failure (does not throw C++ exceptions)
+     */
+    inline HRESULT delete_value_nothrow(HKEY key, _In_opt_ PCWSTR subKey, _In_opt_ PCWSTR value_name) WI_NOEXCEPT
+    {
+        const reg_view_details::reg_view_nothrow regview{key};
+        return regview.delete_value(subKey, value_name);
+    }
+
+    /**
+     * @brief Deletes the specified value from under an open or well-known registry key - see RegDeleteValueW
+     * @param key An open or well-known registry key
+     * @param value_name The name of the registry value to delete.
+     *        Can be nullptr to delete the unnamed default registry value.
+     * @return HRESULT error code indicating success or failure (does not throw C++ exceptions)
+     */
+    inline HRESULT delete_value_nothrow(HKEY key, _In_opt_ PCWSTR value_name) WI_NOEXCEPT
+    {
+        const reg_view_details::reg_view_nothrow regview{key};
+        return regview.delete_value(value_name);
+    }
+
+    /**
+     * @brief Recursively deletes the specified subkey, its values, and all of its descendant subkeys - see RegDeleteTreeW
+     * @param key An open or well-known registry key
+     * @param subKey The name of the subkey to delete (relative to `key`).
+     *        If `nullptr`, then the subkeys and values of `key` are deleted, but `key` itself is not.
+     * @remark Succeeds (does nothing) if the specified subkey does not exist - see wil::reg::is_registry_not_found
+     * @return HRESULT error code indicating success or failure (does not throw C++ exceptions)
+     */
+    inline HRESULT delete_tree_nothrow(HKEY key, _In_opt_ PCWSTR subKey) WI_NOEXCEPT
+    {
+        const reg_view_details::reg_view_nothrow regview{key};
+        return regview.delete_tree(subKey);
+    }
+
     //
     //  wil::key_iterator and wil::value_iterator objects enable enumerating registry keys and values.
     //
@@ -223,7 +309,7 @@ namespace reg
     //
 #if defined(WIL_ENABLE_EXCEPTIONS)
 
-#if defined(_STRING_) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     using key_iterator = ::wil::reg::iterator_t<::wil::reg::key_iterator_data<::std::wstring>>;
     using value_iterator = ::wil::reg::iterator_t<::wil::reg::value_iterator_data<::std::wstring>>;
 #endif
@@ -583,7 +669,7 @@ namespace reg
         ::wil::reg::set_value_expanded_string(key, nullptr, value_name, data);
     }
 
-#if (defined(_VECTOR_) && defined(_STRING_)) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief The generic set_value template function to write a REG_MULTI_SZ value from a std::vector<std::wstring>
      * @param key An open or well-known registry key
@@ -645,9 +731,9 @@ namespace reg
     {
         ::wil::reg::set_value(key, nullptr, value_name, data);
     }
-#endif // #if defined(_VECTOR_) && defined(_STRING_)
+#endif
 
-#if defined(_VECTOR_) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief Writes a registry value of the specified type from a `std::vector<uint8_t>`/`std::vector<BYTE>`
      * @param key An open or well-known registry key
@@ -680,8 +766,8 @@ namespace reg
     {
         ::wil::reg::set_value_binary(key, nullptr, value_name, type, data);
     }
-#endif // #if defined(_VECTOR_)
-#endif // #if defined(WIL_ENABLE_EXCEPTIONS)
+#endif
+#endif
 
     //
     // template <typename T>
@@ -1087,7 +1173,7 @@ namespace reg
         return ::wil::reg::get_value<uint64_t>(key, nullptr, value_name);
     }
 
-#if defined(_STRING_) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief Reads a REG_SZ value, returning a std::wstring
      * @param key An open or well-known registry key
@@ -1210,7 +1296,7 @@ namespace reg
     {
         return ::wil::reg::get_value_expanded_string(key, nullptr, value_name);
     }
-#endif // #if defined(_STRING_)
+#endif
 
 #if defined(__WIL_OLEAUTO_H_) || defined(WIL_DOXYGEN)
     /**
@@ -1482,7 +1568,7 @@ namespace reg
 #endif // #if defined(__WIL_OBJBASE_H_STL)
 #endif // defined(__WIL_OBJBASE_H_)
 
-#if defined(_VECTOR_) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief Reads a registry value of the specified type, returning a std::vector<BYTE>
      * @param key An open or well-known registry key
@@ -1515,9 +1601,9 @@ namespace reg
     {
         return ::wil::reg::get_value_binary(key, nullptr, value_name, type);
     }
-#endif // #if defined(_VECTOR_)
+#endif
 
-#if (defined(_VECTOR_) && defined(_STRING_)) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief Reads a REG_MULTI_SZ value, returning a std::vector<std::wstring>
      * @param key An open or well-known registry key
@@ -1600,9 +1686,9 @@ namespace reg
     {
         return ::wil::reg::get_value<::std::vector<::std::wstring>>(key, nullptr, value_name);
     }
-#endif // #if defined(_VECTOR_) && defined(_STRING_)
+#endif
 
-#if (defined(_OPTIONAL_) && defined(__cpp_lib_optional)) || defined(WIL_DOXYGEN)
+#if (WIL_USE_STL && (__cpp_lib_optional >= 201606L)) || defined(WIL_DOXYGEN)
     //
     // template <typename T>
     // void try_get_value(...)
@@ -1819,7 +1905,7 @@ namespace reg
         return ::wil::reg::try_get_value<uint64_t>(key, nullptr, value_name);
     }
 
-#if defined(_VECTOR_) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief Attempts to read a value under a specified key requiring the specified type, returning the raw bytes in a
      *        std::optional
@@ -1854,9 +1940,9 @@ namespace reg
     {
         return ::wil::reg::try_get_value_binary(key, nullptr, value_name, type);
     }
-#endif // #if defined(_VECTOR_)
+#endif
 
-#if defined(_STRING_) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief Attempts to read a REG_SZ value under a specified key, returning the value in a std::optional
      * @param key An open or well-known registry key
@@ -1986,7 +2072,7 @@ namespace reg
     {
         return ::wil::reg::try_get_value_expanded_string(key, nullptr, value_name);
     }
-#endif // #if defined(_STRING_)
+#endif
 
 #if defined(__WIL_OLEAUTO_H_STL) || defined(WIL_DOXYGEN)
     /**
@@ -2132,7 +2218,7 @@ namespace reg
     }
 #endif // defined(__WIL_OBJBASE_H_STL)
 
-#if (defined(_VECTOR_) && defined(_STRING_)) || defined(WIL_DOXYGEN)
+#if WIL_USE_STL || defined(WIL_DOXYGEN)
     /**
      * @brief Attempts to read a REG_MULTI_SZ value under a specified key, returning the value in a std::optional
      * @param key An open or well-known registry key
@@ -2209,9 +2295,9 @@ namespace reg
     {
         return ::wil::reg::try_get_value<::std::vector<::std::wstring>>(key, nullptr, value_name);
     }
-#endif // #if defined (_VECTOR_) && defined (_STRING_)
-#endif // #if defined (_OPTIONAL_) && defined(__cpp_lib_optional)
-#endif // #if defined(WIL_ENABLE_EXCEPTIONS)
+#endif
+#endif
+#endif
 
     //
     // template <typename T>
@@ -3234,6 +3320,8 @@ private:
                 break;
 
             case ERROR_KEY_DELETED:
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND:
                 // Key deleted, send RegistryChangeKind::Delete, do not re-arm.
                 watcherState->m_callback(RegistryChangeKind::Delete);
                 watcherState->ReleaseFromCallback(false);

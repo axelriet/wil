@@ -384,6 +384,7 @@ TEST_CASE("SafeCastTests::SafeCastThrowsTemplateCheck", "[safecast]")
 }
 #endif
 
+// NOLINTBEGIN(readability-identifier-length): These are all dummy names based off type
 TEST_CASE("SafeCastTests::SafeCastFailFastSyntaxCheck", "[safecast]")
 {
     SECTION("safe_cast_failfast safe")
@@ -570,3 +571,33 @@ TEST_CASE("SafeCastTests::SafeCastExpectFailFast", "[safecast]")
     }
 }
 #endif
+// NOLINTEND(readability-identifier-length)
+
+TEST_CASE("SafeCastTests::ZeroExtendingCast", "[safecast]")
+{
+    constexpr uint32_t c_expected8To32Extension = 0x000000FF;
+    constexpr uint32_t c_expected16To32Extension = 0x0000FFFF;
+    constexpr uint32_t c_expected32To32Extension = 0xFFFFFFFF;
+    constexpr uint64_t c_expected8To64Extension = 0x00000000000000FF;
+    constexpr uint64_t c_expected16To64Extension = 0x000000000000FFFF;
+    constexpr uint64_t c_expected32To64Extension = 0x00000000FFFFFFFF;
+
+    SECTION("int8_t")
+    {
+        int8_t orig = -1;
+        REQUIRE(wil::safe_zero_extending_cast<uint32_t>(orig) == c_expected8To32Extension);
+        REQUIRE(wil::safe_zero_extending_cast<uint64_t>(orig) == c_expected8To64Extension);
+    }
+    SECTION("int16_t")
+    {
+        int16_t orig = -1;
+        REQUIRE(wil::safe_zero_extending_cast<uint32_t>(orig) == c_expected16To32Extension);
+        REQUIRE(wil::safe_zero_extending_cast<uint64_t>(orig) == c_expected16To64Extension);
+    }
+    SECTION("int32_t")
+    {
+        int32_t orig = -1;
+        REQUIRE(wil::safe_zero_extending_cast<uint32_t>(orig) == c_expected32To32Extension);
+        REQUIRE(wil::safe_zero_extending_cast<uint64_t>(orig) == c_expected32To64Extension);
+    }
+}

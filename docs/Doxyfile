@@ -2019,7 +2019,6 @@ PREDEFINED             = WIL_DOXYGEN \
                          _MSVC_LANG=202302L \
                          __WI_CPLUSPLUS=202302L \
                          __WI_LIBCPP_STD_VER=23 \
-                         WIL_HAS_CXX_17=1 \
                          _HAS_CXX17 \
                          _HAS_CXX20 \
                          __declspec(x)= \
@@ -2035,6 +2034,8 @@ PREDEFINED             = WIL_DOXYGEN \
                          __cpp_lib_coroutine=201902L \
                          __has_include(header)=1 \
                          __cpp_lib_apply=201603L \
+                         WIL_USE_STL=1 \
+                         __cpp_lib_string_view=201803L \
 
 @INCLUDE = nosal2.doxyfile
 

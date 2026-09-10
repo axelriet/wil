@@ -8,13 +8,7 @@
 #include <vector>
 #endif
 
-// detect std::wstring_view
-#ifdef __has_include
-#if (__cplusplus >= 201606L || _MSVC_LANG >= 201606L) && __has_include(<string_view>)
-#define __WI_HAS_STD_WSTRING_VIEW
 #include <string_view>
-#endif
-#endif
 
 // Required for pinterface template specializations that we depend on in this test
 #include <Windows.ApplicationModel.Chat.h>
@@ -51,8 +45,9 @@ TEST_CASE("WinRTTests::VerifyTraitsTypes", "[winrt]")
 }
 
 template <bool InhibitArrayReferences, bool IgnoreCase, typename LhsT, typename RhsT>
-void DoHStringComparisonTest(LhsT&& lhs, RhsT&& rhs, int relation)
+static void DoHStringComparisonTest(LhsT&& lhs, RhsT&& rhs, int relation)
 {
+    // NOLINTBEGIN(readability-suspicious-call-argument): Explicitly testing different parameter orders
     using compare = wil::details::hstring_compare<InhibitArrayReferences, IgnoreCase>;
 
     // == and !=
@@ -91,12 +86,13 @@ void DoHStringComparisonTest(LhsT&& lhs, RhsT&& rhs, int relation)
         const wistd::remove_reference_t<RhsT>& constRhs = rhs;
         DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhs, constRhs, relation);
     }
+    // NOLINTEND(readability-suspicious-call-argument)
 }
 
 // The two string arguments are expected to compare equal to one another using the specified IgnoreCase argument and
 // contain at least one embedded null character
 template <bool InhibitArrayReferences, bool IgnoreCase, size_t Size>
-void DoHStringSameValueComparisonTest(const wchar_t (&lhs)[Size], const wchar_t (&rhs)[Size])
+static void DoHStringSameValueComparisonTest(const wchar_t (&lhs)[Size], const wchar_t (&rhs)[Size])
 {
     wchar_t lhsNonConstArray[Size + 5];
     wchar_t rhsNonConstArray[Size + 5];
@@ -179,7 +175,7 @@ void DoHStringSameValueComparisonTest(const wchar_t (&lhs)[Size], const wchar_t 
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstr, rhsHstr, 0);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstr, rhsUniqueStr, 0);
 #endif
-#ifdef __WI_HAS_STD_WSTRING_VIEW
+
     std::wstring_view lhsWstrview(lhs, Size - 1);
     std::wstring_view rhsWstrview(rhs, Size - 1);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsWstrview, 0);
@@ -190,12 +186,11 @@ void DoHStringSameValueComparisonTest(const wchar_t (&lhs)[Size], const wchar_t 
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsStr, 0);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsHstr, 0);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsUniqueStr, 0);
-#endif
 }
 
 // It's expected that the first argument (lhs) compares greater than the second argument (rhs)
 template <bool InhibitArrayReferences, bool IgnoreCase, size_t LhsSize, size_t RhsSize>
-void DoHStringDifferentValueComparisonTest(const wchar_t (&lhs)[LhsSize], const wchar_t (&rhs)[RhsSize])
+static void DoHStringDifferentValueComparisonTest(const wchar_t (&lhs)[LhsSize], const wchar_t (&rhs)[RhsSize])
 {
     wchar_t lhsNonConstArray[LhsSize];
     wchar_t rhsNonConstArray[RhsSize];
@@ -273,7 +268,7 @@ void DoHStringDifferentValueComparisonTest(const wchar_t (&lhs)[LhsSize], const 
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstr, rhsHstr, 1);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstr, rhsUniqueStr, 1);
 #endif
-#ifdef __WI_HAS_STD_WSTRING_VIEW
+
     std::wstring_view lhsWstrview(lhs, LhsSize - 1);
     std::wstring_view rhsWstrview(rhs, RhsSize - 1);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsWstrview, 1);
@@ -284,7 +279,6 @@ void DoHStringDifferentValueComparisonTest(const wchar_t (&lhs)[LhsSize], const 
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsStr, 1);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsHstr, 1);
     DoHStringComparisonTest<InhibitArrayReferences, IgnoreCase>(lhsWstrview, rhsUniqueStr, 1);
-#endif
 }
 
 TEST_CASE("WinRTTests::HStringComparison", "[winrt][hstring_compare]")
@@ -362,7 +356,7 @@ TEST_CASE("WinRTTests::HStringComparison", "[winrt][hstring_compare]")
         DoHStringComparisonTest<false, false>(wstr, str.Get(), 0);
         DoHStringComparisonTest<false, false>(wstr, nullHstr, 0);
 #endif
-#ifdef __WI_HAS_STD_WSTRING_VIEW
+
         std::wstring_view wstrview;
         DoHStringComparisonTest<false, false>(wstrview, wstrview, 0);
         DoHStringComparisonTest<false, false>(wstrview, constArray, 0);
@@ -371,7 +365,6 @@ TEST_CASE("WinRTTests::HStringComparison", "[winrt][hstring_compare]")
         DoHStringComparisonTest<false, false>(wstrview, nullCstr, 0);
         DoHStringComparisonTest<false, false>(wstrview, str.Get(), 0);
         DoHStringComparisonTest<false, false>(wstrview, nullHstr, 0);
-#endif
     }
 }
 
@@ -426,9 +419,7 @@ TEST_CASE("WinRTTests::HStringMapTest", "[winrt][hstring_compare]")
 
     HStringReference ref(constArray);
     std::wstring wstr(constArray, 7);
-#ifdef __WI_HAS_STD_WSTRING_VIEW
     std::wstring_view wstrview(wstr);
-#endif
 
     auto verifyFunc = [&](int expectedValue, auto&& keyValue) {
         auto itr = hstringMap.find(std::forward<decltype(keyValue)>(keyValue));
@@ -443,9 +434,7 @@ TEST_CASE("WinRTTests::HStringMapTest", "[winrt][hstring_compare]")
     verifyFunc(expectedValue, key.Get());
     verifyFunc(expectedValue, ref);
     verifyFunc(expectedValue, wstr);
-#ifdef __WI_HAS_STD_WSTRING_VIEW
     verifyFunc(expectedValue, wstrview);
-#endif
 
     // Arrays/strings should not deduce length and should therefore find "foo"
     expectedValue = wstringMap[L"foo"];
@@ -466,9 +455,7 @@ TEST_CASE("WinRTTests::HStringMapTest", "[winrt][hstring_compare]")
     HSTRING nullHstr = nullptr;
 
     std::wstring emptyWstr;
-#ifdef __WI_HAS_STD_WSTRING_VIEW
     std::wstring_view emptywstrview;
-#endif
 
     expectedValue = wstringMap[L""];
     verifyFunc(expectedValue, constEmptyArray);
@@ -478,9 +465,7 @@ TEST_CASE("WinRTTests::HStringMapTest", "[winrt][hstring_compare]")
     verifyFunc(expectedValue, emptyStr);
     verifyFunc(expectedValue, nullHstr);
     verifyFunc(expectedValue, emptyWstr);
-#ifdef __WI_HAS_STD_WSTRING_VIEW
     verifyFunc(expectedValue, emptywstrview);
-#endif
 }
 
 TEST_CASE("WinRTTests::HStringCaseInsensitiveMapTest", "[winrt][hstring_compare]")
@@ -519,9 +504,7 @@ TEST_CASE("WinRTTests::HStringCaseInsensitiveMapTest", "[winrt][hstring_compare]
 
     HStringReference ref(constArray);
     std::wstring wstr(constArray, 7);
-#ifdef __WI_HAS_STD_WSTRING_VIEW
     std::wstring_view wstrview(wstr);
-#endif
 
     auto verifyFunc = [&](int expectedValue, auto&& key) {
         auto itr = hstringMap.find(std::forward<decltype(key)>(key));
@@ -535,9 +518,7 @@ TEST_CASE("WinRTTests::HStringCaseInsensitiveMapTest", "[winrt][hstring_compare]
     verifyFunc(foobarValue, key.Get());
     verifyFunc(foobarValue, ref);
     verifyFunc(foobarValue, wstr);
-#ifdef __WI_HAS_STD_WSTRING_VIEW
     verifyFunc(foobarValue, wstrview);
-#endif
 
     // Arrays/strings should not deduce length and should therefore find "foo"
     verifyFunc(fooValue, constArray);
@@ -546,8 +527,8 @@ TEST_CASE("WinRTTests::HStringCaseInsensitiveMapTest", "[winrt][hstring_compare]
 }
 #endif
 
-// This is not a test method, nor should it be called. This is a compilation-only test.
 #ifdef WIL_ENABLE_EXCEPTIONS
+// NOLINTNEXTLINE(misc-use-internal-linkage): This is not a test method, nor should it be called. This is a compilation-only test.
 void RunWhenCompleteCompilationTest()
 {
     {
@@ -601,9 +582,9 @@ TEST_CASE("WinRTTests::WaitForCompletionTimeout", "[winrt][wait_for_completion]"
     REQUIRE(timedOut);
 }
 
-// This is not a test method, nor should it be called. This is a compilation-only test.
 #pragma warning(push)
 #pragma warning(disable : 4702) // Unreachable code
+// NOLINTNEXTLINE(misc-use-internal-linkage): This is not a test method, nor should it be called. This is a compilation-only test.
 void WaitForCompletionCompilationTest()
 {
     // Ensure the wait_for_completion variants compile
@@ -701,7 +682,7 @@ TEST_CASE("WinRTTests::TimeTTests", "[winrt][time_t]")
 }
 
 template <template <typename> class ResultT = IVector>
-ComPtr<ResultT<IInspectable*>> MakeSampleInspectableVector(UINT32 count = 5)
+static ComPtr<ResultT<IInspectable*>> MakeSampleInspectableVector(UINT32 count = 5)
 {
     auto result = Make<FakeVector<IInspectable*>>();
     REQUIRE(result);
@@ -720,7 +701,7 @@ ComPtr<ResultT<IInspectable*>> MakeSampleInspectableVector(UINT32 count = 5)
 }
 
 template <template <typename> class ResultT = IVector>
-ComPtr<ResultT<HSTRING>> MakeSampleStringVector()
+static ComPtr<ResultT<HSTRING>> MakeSampleStringVector()
 {
     auto result = Make<FakeVector<HSTRING>>();
     REQUIRE(result);
@@ -735,7 +716,7 @@ ComPtr<ResultT<HSTRING>> MakeSampleStringVector()
 }
 
 template <template <typename> class ResultT = IVector>
-ComPtr<ResultT<Point>> MakeSamplePointVector(int count = 5)
+static ComPtr<ResultT<Point>> MakeSamplePointVector(int count = 5)
 {
     auto result = Make<FakeVector<Point>>();
     REQUIRE(result);
@@ -750,7 +731,7 @@ ComPtr<ResultT<Point>> MakeSamplePointVector(int count = 5)
 }
 
 template <typename T>
-auto cast_to(ComPtr<IInspectable> const& src)
+static auto cast_to(ComPtr<IInspectable> const& src)
 {
     ComPtr<IReference<T>> theRef;
     T value{};
@@ -943,7 +924,7 @@ TEST_CASE("WinRTTests::VectorRangeTest", "[winrt][vector_range]")
         auto val = ref;
         itr = itr;
         REQUIRE(val == ref);
-        itr = std::move(itr);
+        itr = std::move(itr); // NOLINT(performance-move-const-arg): Iterator does not have move assignment operator, but we want to test this anyway
         REQUIRE(val == ref);
     }
 
@@ -955,13 +936,13 @@ TEST_CASE("WinRTTests::VectorRangeTest", "[winrt][vector_range]")
         auto val = ref.Get();
         itr = itr;
         REQUIRE(val == ref);
-        itr = std::move(itr);
+        itr = std::move(itr); // NOLINT(performance-move-const-arg): Iterator does not have move assignment operator, but we want to test this anyway
         REQUIRE(val == ref.Get());
     }
 #endif
 }
 
-unsigned long GetComObjectRefCount(IUnknown* unk)
+static unsigned long GetComObjectRefCount(IUnknown* unk)
 {
     unk->AddRef();
     return unk->Release();
@@ -1164,7 +1145,7 @@ TEST_CASE("WinRTTests::IterableRangeTest", "[winrt][iterable_range]")
         auto val = ref;
         itr = itr;
         REQUIRE(val == ref);
-        itr = std::move(itr);
+        itr = std::move(itr); // NOLINT(performance-move-const-arg): Iterator does not have move assignment operator, but we want to test this anyway
         REQUIRE(val == ref);
     }
 
@@ -1176,7 +1157,7 @@ TEST_CASE("WinRTTests::IterableRangeTest", "[winrt][iterable_range]")
         auto val = ref.Get();
         itr = itr;
         REQUIRE(val == ref);
-        itr = std::move(itr);
+        itr = std::move(itr); // NOLINT(performance-move-const-arg): Iterator does not have move assignment operator, but we want to test this anyway
         REQUIRE(val == ref.Get());
     }
 #endif

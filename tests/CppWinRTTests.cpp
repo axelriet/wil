@@ -10,13 +10,15 @@
 #include <winrt/Windows.ApplicationModel.Activation.h>
 #include <wil/cppwinrt_helpers.h>
 #include <winrt/Windows.System.h>
-#include <wil/cppwinrt_helpers.h> // Verify can include a second time to unlock more features
+#include <wil/cppwinrt_helpers.h> // NOLINT(readability-duplicate-include) Verify can include a second time to unlock more features
+#include <wil/stl.h>
 
 using namespace winrt::Windows::ApplicationModel::Activation;
 
 #include "catch.hpp"
 #include <roerrorapi.h>
 #include "common.h"
+#include "cppwinrt_threadpool_guard.h"
 
 // HRESULT values that C++/WinRT throws as something other than winrt::hresult_error - e.g. a type derived from
 // winrt::hresult_error, std::*, etc.
@@ -37,18 +39,18 @@ static const HRESULT cppwinrt_mapped_hresults[] = {
 };
 
 template <typename T>
-auto copy_thing(T const& src)
+static auto copy_thing(T const& src)
 {
     return std::decay_t<T>(src);
 }
 
 template <typename T, typename K>
-void CheckMapVector(std::vector<winrt::Windows::Foundation::Collections::IKeyValuePair<T, K>> const& test, std::map<T, K> const& src)
+static void CheckMapVector(std::vector<winrt::Windows::Foundation::Collections::IKeyValuePair<T, K>> const& test, std::map<T, K> const& src)
 {
     REQUIRE(test.size() == src.size());
-    for (auto&& i : test)
+    for (auto&& pair : test)
     {
-        REQUIRE(i.Value() == src.at(i.Key()));
+        REQUIRE(pair.Value() == src.at(pair.Key()));
     }
 }
 
@@ -129,35 +131,35 @@ TEST_CASE("CppWinRTTests::VectorToVector", "[cppwinrt]")
     winrt::init_apartment();
     {
         std::vector<winrt::hstring> src_vector = {L"foo", L"bar", L"bas"};
-        auto sv = winrt::single_threaded_vector(copy_thing(src_vector));
-        REQUIRE(wil::to_vector(sv) == src_vector);
-        REQUIRE(wil::to_vector(sv.GetView()) == src_vector);
-        REQUIRE(wil::to_vector(sv.First()) == src_vector);
-        REQUIRE(wil::to_vector(sv.First()) == src_vector);
-        REQUIRE(wil::to_vector(sv.as<winrt::Windows::Foundation::Collections::IIterable<winrt::hstring>>()) == src_vector);
+        auto winrtVec = winrt::single_threaded_vector(copy_thing(src_vector));
+        REQUIRE(wil::to_vector(winrtVec) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.GetView()) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.First()) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.First()) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.as<winrt::Windows::Foundation::Collections::IIterable<winrt::hstring>>()) == src_vector);
     }
     {
         std::vector<uint32_t> src_vector = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
-        auto sv = winrt::single_threaded_vector(copy_thing(src_vector));
-        REQUIRE(wil::to_vector(sv) == src_vector);
-        REQUIRE(wil::to_vector(sv.GetView()) == src_vector);
-        REQUIRE(wil::to_vector(sv.First()) == src_vector);
-        REQUIRE(wil::to_vector(sv.as<winrt::Windows::Foundation::Collections::IIterable<uint32_t>>()) == src_vector);
+        auto winrtVec = winrt::single_threaded_vector(copy_thing(src_vector));
+        REQUIRE(wil::to_vector(winrtVec) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.GetView()) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.First()) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.as<winrt::Windows::Foundation::Collections::IIterable<uint32_t>>()) == src_vector);
     }
     {
         std::vector<float> src_vector;
-        auto sv = winrt::single_threaded_vector(copy_thing(src_vector));
-        REQUIRE(wil::to_vector(sv) == src_vector);
-        REQUIRE(wil::to_vector(sv.GetView()) == src_vector);
-        REQUIRE(wil::to_vector(sv.First()) == src_vector);
-        REQUIRE(wil::to_vector(sv.as<winrt::Windows::Foundation::Collections::IIterable<float>>()) == src_vector);
+        auto winrtVec = winrt::single_threaded_vector(copy_thing(src_vector));
+        REQUIRE(wil::to_vector(winrtVec) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.GetView()) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.First()) == src_vector);
+        REQUIRE(wil::to_vector(winrtVec.as<winrt::Windows::Foundation::Collections::IIterable<float>>()) == src_vector);
     }
     {
         std::map<winrt::hstring, winrt::hstring> src_map{{L"kittens", L"fluffy"}, {L"puppies", L"cute"}};
-        auto sm = winrt::single_threaded_map(copy_thing(src_map));
-        CheckMapVector(wil::to_vector(sm), src_map);
-        CheckMapVector(wil::to_vector(sm.GetView()), src_map);
-        CheckMapVector(wil::to_vector(sm.First()), src_map);
+        auto winrtMap = winrt::single_threaded_map(copy_thing(src_map));
+        CheckMapVector(wil::to_vector(winrtMap), src_map);
+        CheckMapVector(wil::to_vector(winrtMap.GetView()), src_map);
+        CheckMapVector(wil::to_vector(winrtMap.First()), src_map);
     }
     {
         winrt::Windows::Foundation::Collections::PropertySet props;
@@ -165,15 +167,15 @@ TEST_CASE("CppWinRTTests::VectorToVector", "[cppwinrt]")
         props.Insert(L"puppy", winrt::box_value<uint32_t>(25));
         auto converted = wil::to_vector(props);
         REQUIRE(converted.size() == props.Size());
-        for (auto&& kv : converted)
+        for (auto&& pair : converted)
         {
-            if (kv.Key() == L"kitten")
+            if (pair.Key() == L"kitten")
             {
-                REQUIRE(kv.Value().as<winrt::hstring>() == L"fluffy");
+                REQUIRE(pair.Value().as<winrt::hstring>() == L"fluffy");
             }
-            else if (kv.Key() == L"puppy")
+            else if (pair.Key() == L"puppy")
             {
-                REQUIRE(kv.Value().as<uint32_t>() == 25);
+                REQUIRE(pair.Value().as<uint32_t>() == 25);
             }
             else
             {
@@ -185,21 +187,25 @@ TEST_CASE("CppWinRTTests::VectorToVector", "[cppwinrt]")
         std::vector<BackgroundActivatedEventArgs> src_vector;
         src_vector.emplace_back(BackgroundActivatedEventArgs{nullptr});
         src_vector.emplace_back(BackgroundActivatedEventArgs{nullptr});
-        auto sv = winrt::single_threaded_vector(copy_thing(src_vector));
-        REQUIRE(wil::to_vector(sv) == src_vector);
+        auto winrtVec = winrt::single_threaded_vector(copy_thing(src_vector));
+        REQUIRE(wil::to_vector(winrtVec) == src_vector);
     }
 
     REQUIRE_THROWS(wil::to_vector(winrt::make<unstable_vector>()));
 
     auto ilike = wil::to_vector(iterable_like{});
     REQUIRE(ilike.size() == iterator_like::total);
-    for (auto&& i : ilike)
-        REQUIRE(i == iterator_like{}.Current());
+    for (auto&& val : ilike)
+    {
+        REQUIRE(val == iterator_like{}.Current());
+    }
 
     auto vlike = wil::to_vector(vector_like{});
     REQUIRE(vlike.size() == vector_like{}.Size());
-    for (auto&& i : vlike)
-        REQUIRE(i == vector_like{}.GetAt(0));
+    for (auto&& val : vlike)
+    {
+        REQUIRE(val == vector_like{}.GetAt(0));
+    }
 
     winrt::clear_factory_cache();
     winrt::uninit_apartment();
@@ -343,13 +349,13 @@ TEST_CASE("CppWinRTTests::ModuleReference", "[cppwinrt]")
         {
             wil::winrt_module_reference ref;
         };
-        object_with_ref o1;
+        object_with_ref obj1;
         REQUIRE(peek_module_ref_count() == initial + 1);
-        auto o2 = o1;
+        auto obj2 = obj1;
         REQUIRE(peek_module_ref_count() == initial + 2);
-        o1 = o2;
+        obj1 = obj2;
         REQUIRE(peek_module_ref_count() == initial + 2);
-        o2 = std::move(o1);
+        obj2 = std::move(obj1);
         REQUIRE(peek_module_ref_count() == initial + 2);
     }
     REQUIRE(peek_module_ref_count() == initial);
@@ -560,6 +566,8 @@ wil::com_task<void> test_sta_task(HANDLE e)
 
 TEST_CASE("CppWinRTTests::SimpleTaskTest", "[cppwinrt]")
 {
+    cppwinrt_threadpool_guard guard;
+
     std::thread([] {
         // MTA tests
         wil::unique_mta_usage_cookie cookie;
@@ -590,6 +598,8 @@ TEST_CASE("CppWinRTTests::SimpleTaskTest", "[cppwinrt]")
 
 TEST_CASE("CppWinRTTests::TasksPropagateErrorState", "[cppwinrt]")
 {
+    cppwinrt_threadpool_guard guard;
+
     std::thread([] {
         // MTA tests
         wil::unique_mta_usage_cookie cookie;
@@ -690,6 +700,7 @@ TEST_CASE("CppWinRTTests::ResumeForegroundTests", "[cppwinrt]")
     using Verify = decltype(wil::resume_foreground(winrt::Windows::System::DispatcherQueue{nullptr}));
     static_assert(wistd::is_trivial_v<Verify> || !wistd::is_trivial_v<Verify>);
 
+#pragma warning(suppress : 4714) // 'HRESULT_FROM_WIN32' marked as __forceinline not inlined
     []() -> winrt::Windows::Foundation::IAsyncAction {
         test::TestDispatcher dispatcher;
 
@@ -758,4 +769,238 @@ TEST_CASE("CppWinRTTests::ThrownExceptionWithMessage", "[cppwinrt]")
         CATCH_RETURN();
     }();
     witest::RequireRestrictedErrorInfo(E_INVALIDARG, L"The parameter is incorrect.\r\n");
+}
+
+TEST_CASE("CppWinRTTests::ZStringViewFromHString", "[cppwinrt]")
+{
+    winrt::hstring hstr = L"Hello";
+    REQUIRE(wil::zwstring_view(hstr) == hstr);
+}
+TEST_CASE("CppWinRTTests::BatchedRangeAdapter", "[cppwinrt]")
+{
+    using namespace winrt::Windows::Foundation::Collections;
+
+    // Indexed collection spanning multiple GetMany blocks (int32 block is 128).
+    {
+        std::vector<int32_t> expected;
+        for (int32_t i = 0; i < 300; ++i)
+        {
+            expected.push_back(i);
+        }
+
+        auto vec = winrt::single_threaded_vector<int32_t>(std::vector<int32_t>(expected));
+
+        std::vector<int32_t> observed;
+        for (auto&& value : wil::batched_range(vec))
+        {
+            observed.push_back(value);
+        }
+        REQUIRE(observed == expected);
+
+        // The read-only view goes through the same indexed path.
+        observed.clear();
+        for (auto&& value : wil::batched_range(vec.GetView()))
+        {
+            observed.push_back(value);
+        }
+        REQUIRE(observed == expected);
+    }
+
+    // Exactly one element beyond a single block boundary.
+    {
+        auto vec = winrt::single_threaded_vector<int32_t>(std::vector<int32_t>(129, 7));
+        uint32_t count = 0;
+        for (auto&& value : wil::batched_range(vec))
+        {
+            REQUIRE(value == 7);
+            ++count;
+        }
+        REQUIRE(count == 129);
+    }
+
+    // Empty collection yields nothing.
+    {
+        auto vec = winrt::single_threaded_vector<int32_t>();
+        uint32_t count = 0;
+        for (auto&& value : wil::batched_range(vec))
+        {
+            (void)value;
+            ++count;
+        }
+        REQUIRE(count == 0);
+    }
+
+    // Iterable-only path (IIterable has no GetAt) buffers through IIterator::GetMany.
+    {
+        std::vector<winrt::hstring> expected = {L"a", L"b", L"c"};
+        IIterable<winrt::hstring> iterable = winrt::single_threaded_vector<winrt::hstring>(std::vector<winrt::hstring>(expected));
+
+        std::vector<winrt::hstring> observed;
+        for (auto&& value : wil::batched_range(iterable))
+        {
+            observed.push_back(value);
+        }
+        REQUIRE(observed == expected);
+    }
+
+    // Directly batching an iterator yields its current position onward.
+    {
+        auto vec = winrt::single_threaded_vector<int32_t>({1, 2, 3, 4, 5});
+        std::vector<int32_t> observed;
+        for (auto&& value : wil::batched_range(vec.First()))
+        {
+            observed.push_back(value);
+        }
+        REQUIRE(observed == std::vector<int32_t>({1, 2, 3, 4, 5}));
+    }
+
+    // Map batches over IKeyValuePair through the iterable path.
+    {
+        std::map<winrt::hstring, winrt::hstring> src{{L"kittens", L"fluffy"}, {L"puppies", L"cute"}};
+        auto map = winrt::single_threaded_map<winrt::hstring, winrt::hstring>(std::map<winrt::hstring, winrt::hstring>(src));
+        uint32_t count = 0;
+        for (auto&& pair : wil::batched_range(map))
+        {
+            REQUIRE(pair.Value() == src.at(pair.Key()));
+            ++count;
+        }
+        REQUIRE(count == src.size());
+    }
+
+    // Non-WinRT indexed shape works too, matching to_vector's duck typing.
+    {
+        uint32_t count = 0;
+        for (auto&& value : wil::batched_range(vector_like{}))
+        {
+            REQUIRE(value == vector_like{}.GetAt(0));
+            ++count;
+        }
+        REQUIRE(count == vector_like{}.Size());
+    }
+
+    // Block-boundary edge cases. For int32 the prefetch block is 128, so exercise exactly one and
+    // exactly two full blocks: the "full block implies maybe-more" rule must fetch the trailing
+    // empty block and terminate cleanly -- no infinite loop, no dropped or duplicated element.
+    for (int32_t total : {1, 127, 128, 129, 256, 257})
+    {
+        std::vector<int32_t> expected;
+        for (int32_t i = 0; i < total; ++i)
+        {
+            expected.push_back(i);
+        }
+
+        // Indexed path.
+        auto vec = winrt::single_threaded_vector<int32_t>(std::vector<int32_t>(expected));
+        std::vector<int32_t> observed;
+        for (auto&& value : wil::batched_range(vec))
+        {
+            observed.push_back(value);
+        }
+        REQUIRE(observed == expected); // exact count and in-order, so no skip/dup across seams
+
+        // Iterable-only path exercises the same boundary through IIterator::GetMany.
+        IIterable<int32_t> iterable = winrt::single_threaded_vector<int32_t>(std::vector<int32_t>(expected));
+        observed.clear();
+        for (auto&& value : wil::batched_range(iterable))
+        {
+            observed.push_back(value);
+        }
+        REQUIRE(observed == expected);
+    }
+
+    // Batching an iterator already advanced past its start yields only the remainder, matching
+    // to_vector's "current position and everything after it" contract (no re-anchor to index 0).
+    {
+        auto vec = winrt::single_threaded_vector<int32_t>({10, 20, 30, 40});
+        auto it = vec.First();
+        REQUIRE(it.Current() == 10);
+        it.MoveNext(); // now positioned at 20
+
+        std::vector<int32_t> observed;
+        for (auto&& value : wil::batched_range(it))
+        {
+            observed.push_back(value);
+        }
+        REQUIRE(observed == std::vector<int32_t>({20, 30, 40}));
+    }
+}
+
+TEST_CASE("CppWinRTTests::MakeReady", "[cppwinrt]")
+{
+    using namespace winrt;
+    using namespace winrt::Windows::Foundation;
+
+    // Completed synchronously with a value, with no coroutine frame.
+    {
+        IAsyncOperation<int32_t> op = wil::already_complete(42);
+        REQUIRE(op.Status() == AsyncStatus::Completed);
+        REQUIRE(op.ErrorCode() == 0);
+        REQUIRE(op.GetResults() == 42);
+        REQUIRE(op.get() == 42);
+    }
+
+    // co_await yields the value through the synchronous-completion path.
+    {
+        auto coro = []() -> IAsyncOperation<int32_t> {
+            co_return co_await wil::already_complete(7);
+        };
+        REQUIRE(coro().get() == 7);
+    }
+
+    // A Completed handler on an already-completed operation fires immediately.
+    {
+        auto op = wil::already_complete(5);
+        int32_t observed = 0;
+        AsyncStatus observed_status = AsyncStatus::Started;
+        op.Completed([&](IAsyncOperation<int32_t> const& sender, AsyncStatus status) {
+            observed = sender.GetResults();
+            observed_status = status;
+        });
+        REQUIRE(observed == 5);
+        REQUIRE(observed_status == AsyncStatus::Completed);
+    }
+
+    // Assigning Completed twice is illegal, matching the coroutine promise.
+    {
+        auto op = wil::already_complete(1);
+        op.Completed([](auto&&, auto&&) {});
+        REQUIRE_THROWS_AS(op.Completed([](auto&&, auto&&) {}), hresult_illegal_delegate_assignment);
+    }
+
+    // Action variant carries no result.
+    {
+        IAsyncAction action = wil::already_complete();
+        REQUIRE(action.Status() == AsyncStatus::Completed);
+        action.get();
+    }
+
+    // A non-trivial result type round-trips.
+    {
+        auto op = wil::already_complete(hstring{L"ready"});
+        REQUIRE(op.get() == L"ready");
+    }
+
+    // Failed action: Error status, GetResults/get throw the carried HRESULT.
+    {
+        IAsyncAction action = wil::already_failed(E_ACCESSDENIED);
+        REQUIRE(action.Status() == AsyncStatus::Error);
+        REQUIRE(action.ErrorCode() == E_ACCESSDENIED);
+        REQUIRE_THROWS_AS(action.get(), hresult_access_denied);
+    }
+
+    // Failed operation: GetResults throws the carried HRESULT.
+    {
+        auto op = wil::already_failed<int32_t>(E_INVALIDARG);
+        REQUIRE(op.Status() == AsyncStatus::Error);
+        REQUIRE_THROWS_AS(op.GetResults(), hresult_invalid_argument);
+    }
+
+    // Failed operation whose result is a projected runtimeclass with no default constructor: the
+    // result storage must be null-initialized (Uri{nullptr}), never activated. A plain value-init
+    // here would fail to compile, and for default-activatable classes would needlessly activate.
+    {
+        auto op = wil::already_failed<winrt::Windows::Foundation::Uri>(E_FAIL);
+        REQUIRE(op.Status() == AsyncStatus::Error);
+        REQUIRE_THROWS(op.GetResults());
+    }
 }

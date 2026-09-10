@@ -1,7 +1,7 @@
 #include "common.h"
 #include <wil/windowing.h>
 
-#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP) && WIL_HAS_CXX_17
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
 TEST_CASE("EnumWindows", "[windowing]")
 {
     // lambda can return a bool
@@ -75,8 +75,30 @@ TEST_CASE("EnumThreadWindows", "[windowing]")
     wil::for_each_window_nothrow([&thread_id](HWND hwnd) {
         if (IsWindow(hwnd) && IsWindowVisible(hwnd))
         {
-            thread_id = GetWindowThreadProcessId(hwnd, nullptr);
-            return false;
+            DWORD pid;
+            thread_id = ::GetWindowThreadProcessId(hwnd, &pid);
+
+            // Ideally, the window handle will be from a long lived process like Explorer so that it doesn't get
+            // destroyed - or perhaps more accurately so that the thread doesn't terminate - before we're done with this
+            // test.
+            wil::unique_handle proc{::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)};
+            if (proc)
+            {
+                wchar_t processName[MAX_PATH];
+                DWORD size = MAX_PATH;
+                if (::QueryFullProcessImageNameW(proc.get(), 0, processName, &size))
+                {
+                    auto len = ::wcslen(processName);
+                    if ((len >= 13) && (::wcscmp(processName + len - 13, L"\\explorer.exe") == 0))
+                    {
+                        // Assume long lived process - stop searching
+                        return false;
+                    }
+                }
+            }
+
+            // Not Explorer - we'll save the thread id, but continue iteration to try and find a better handle
+            return true;
         }
         return true;
     });
@@ -149,12 +171,23 @@ TEST_CASE("EnumThreadWindows", "[windowing]")
 #endif
 }
 
+static bool has_child_window(HWND hwnd)
+{
+    bool hasChildWindow = false;
+    wil::for_each_child_window_nothrow(hwnd, [&hasChildWindow](HWND) {
+        hasChildWindow = true;
+        return false;
+    });
+    return hasChildWindow;
+}
+
 TEST_CASE("EnumChildWindows", "[windowing]")
 {
     // find any window
     HWND parent{};
+
     wil::for_each_window_nothrow([&parent](HWND hwnd) {
-        if (IsWindow(hwnd) && IsWindowVisible(hwnd))
+        if (IsWindow(hwnd) && IsWindowVisible(hwnd) && has_child_window(hwnd))
         {
             // Make sure we choose a window that has children
             bool hasChildren = false;
@@ -225,6 +258,7 @@ TEST_CASE("EnumChildWindows", "[windowing]")
         wil::for_each_child_window(parent, [&windows](HWND hwnd) {
             windows.push_back(hwnd);
         });
+        REQUIRE(!windows.empty());
         wil::for_each_child_window(parent, [windows = std::vector<HWND>{}](HWND hwnd) mutable {
             windows.push_back(hwnd);
         });
