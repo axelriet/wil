@@ -196,13 +196,13 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 //            evaluate its message
 // The default value is '0', with which the macros expand exactly as they always did.  With '1', the macro passes
 // its message in a lambda that captures by reference, which the function called by the macro calls only on
-// failure.  In that mode:
-//      * C++14 is required.  An older standard fails to compile rather than evaluate every argument, since a
-//        translation unit that sets '1' may rely on it (an argument valid only on failure would crash).
+// failure, and which passes the format string and its arguments on as var-args, as the macro does with '0' (a
+// constant named in an argument is not captured).  In that mode:
 //      * The check is inlined or not as RESULT_INLINE_ERROR_TESTS says, as for the macros without a message.
 //        With RESULT_INLINE_ERROR_TESTS '1', the reported return address is in the function that uses the
-//        macro once the compiler inlines (in builds that do not, such as /Od, it is in WIL's code, as for the
-//        macros without a message); with '0', it always is, and each use of a macro calls a function of its own.
+//        macro once the compiler inlines; in builds that do not (such as /Od), it is in the lambda of the macro,
+//        a function of its own within the function that uses the macro, which each use of a macro has.  With
+//        '0', it is in the function that uses the macro, and each use of a macro calls a function of its own.
 //      * The macros that report the last error (XXX_IF_WIN32_BOOL_FALSE_MSG, XXX_LAST_ERROR_IF_MSG and
 //        XXX_LAST_ERROR_IF_NULL_MSG) read it right after the check, before the arguments run, and restore it
 //        after them, so that they report the error of the checked call whatever the arguments do to it.  (With
@@ -211,15 +211,14 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 //      * The LOG_ and FAIL_FAST_ functions stay noexcept, and now evaluate the arguments: an argument that
 //        throws on failure ends the process (std::terminate) instead of propagating, and C++ Core Check no
 //        longer reports it (C26447) in a noexcept caller.  THROW_ propagates it.
-//      * Cost, measured over eight common forms of these macros, 240 and 1000 uses each in a function of its own
-//        (MSVC x64 and ARM64, clang-cl x64, /O2): with RESULT_INLINE_ERROR_TESTS '1', a check that passes runs
-//        its test and nothing else, and each use takes 2% to 7% more code than with this setting at '0'.  With
-//        RESULT_INLINE_ERROR_TESTS '0', a check that passes also stores the addresses of the variables its
-//        message names and calls a function of its own, and each use takes 2% to 5% more code with MSVC and
-//        twice as much with clang, whose /GS then guards most functions that use one.  Either way, each use
-//        instantiates its own lambda and conditional method: 1 to 2 ms more to compile (1.5 to 2.1 times as
-//        long as with this setting at '0'), and with /Zi 4 to 5 KB more of object file with MSVC (1 to 2 KB
-//        with clang).
+//      * Static analysis sees the arguments in the lambda, as in a function of its own.  PREfast checks the
+//        format string against them, as with '0', but no longer follows the paths of the calling function into
+//        them: it does not report a pointer that may be null dereferenced in an argument (C6011), and reports an
+//        index out of range there with less detail (C6385 without C6201).
+//      * Cost: each use instantiates a lambda and may emit an additional reporter call. A successful check
+//        skips message evaluation, but code size, compile time and call overhead depend on the compiler,
+//        optimization and diagnostic settings. Compare optimized code for the consuming workload before
+//        enabling this setting for performance; it is off by default.
 // The arguments become code of the lambda, with the limits of a lambda:
 //      * __func__, __FUNCTION__, __FUNCSIG__, __PRETTY_FUNCTION__ and std::source_location::current() in an
 //        argument (or __FUNCTION__ spliced into the format string) describe the lambda, not the calling
@@ -280,9 +279,6 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #endif
 #if (RESULT_LAZY_MESSAGE_ARGUMENTS != 0) && (RESULT_LAZY_MESSAGE_ARGUMENTS != 1)
 #error Invalid value for 'RESULT_LAZY_MESSAGE_ARGUMENTS'; valid values are 0 and 1
-#endif
-#if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1) && (__WI_LIBCPP_STD_VER < 14)
-#error RESULT_LAZY_MESSAGE_ARGUMENTS 1 requires C++14 or later, since it passes the message in a generic lambda
 #endif
 /// @endcond
 
@@ -428,6 +424,15 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __R_FN_UNREFERENCED \
     __R_IF_CALLERADDRESS((void)callerReturnAddress;) \
     __R_IF_LINE((void)lineNumber;) __R_IF_FILE((void)fileName;) __R_IF_FUNCTION((void)functionName;) __R_IF_CODE((void)code;)
+#define __R_FN_FIELDS \
+    __R_IF_CALLERADDRESS(void* m_callerReturnAddress;) \
+    __R_IF_LINE(unsigned int m_lineNumber;) \
+    __R_IF_FILE(PCSTR m_fileName;) __R_IF_FUNCTION(PCSTR m_functionName;) __R_IF_CODE(PCSTR m_code;)
+#define __R_FN_FIELDS_CALL(reporter) \
+    __R_IF_CALLERADDRESS(reporter.m_callerReturnAddress __R_IF_COMMA) \
+    __R_IF_LINE(reporter.m_lineNumber) \
+    __R_IF_FILE(__R_COMMA reporter.m_fileName) \
+    __R_IF_FUNCTION(__R_COMMA reporter.m_functionName) __R_IF_CODE(__R_COMMA reporter.m_code) __R_IF_TRAIL_COMMA
 // 1) Direct Methods
 //      * Called Directly by Macros
 //      * Always noinline
@@ -466,13 +471,26 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     template <unsigned int optimizerCounter> \
     inline __declspec(noinline) RESULT_NORETURN void MethodName
 #define __R_CALL_INTERNAL_INLINE_METHOD(MethodName) MethodName<optimizerCounter>
+#define __R_INTERNAL_INLINE_REPORT_METHOD(MethodName) \
+    template <unsigned int optimizerCounter> \
+    static __declspec(noinline) void MethodName
+#define __R_INTERNAL_INLINE_NORET_REPORT_METHOD(MethodName) \
+    template <unsigned int optimizerCounter> \
+    static __declspec(noinline) RESULT_NORETURN void MethodName
+#define __R_CALL_INTERNAL_INLINE_REPORT(ReporterType, MethodName) ReporterType::template MethodName<__COUNTER__>
 #else
 #define __R_INTERNAL_NOINLINE_METHOD(MethodName) inline void MethodName
 #define __R_INTERNAL_NOINLINE_NORET_METHOD(MethodName) inline RESULT_NORETURN void MethodName
 #define __R_INTERNAL_INLINE_METHOD(MethodName) inline __declspec(noinline) void MethodName
 #define __R_INTERNAL_INLINE_NORET_METHOD(MethodName) inline __declspec(noinline) RESULT_NORETURN void MethodName
 #define __R_CALL_INTERNAL_INLINE_METHOD(MethodName) MethodName
+#define __R_INTERNAL_INLINE_REPORT_METHOD(MethodName) static __declspec(noinline) void MethodName
+#define __R_INTERNAL_INLINE_NORET_REPORT_METHOD(MethodName) static __declspec(noinline) RESULT_NORETURN void MethodName
+#define __R_CALL_INTERNAL_INLINE_REPORT(ReporterType, MethodName) ReporterType::MethodName
 #endif
+#define __R_INTERNAL_NOINLINE_REPORT_METHOD(MethodName) static void MethodName
+#define __R_INTERNAL_NOINLINE_NORET_REPORT_METHOD(MethodName) static RESULT_NORETURN void MethodName
+#define __R_CALL_INTERNAL_NOINLINE_REPORT(ReporterType, MethodName) ReporterType::MethodName
 #define __R_CALL_INTERNAL_NOINLINE_METHOD(MethodName) MethodName
 #define __R_INTERNAL_NOINLINE_FN_PARAMS __R_FN_PARAMS void* returnAddress __R_COMMA
 #define __R_INTERNAL_NOINLINE_FN_PARAMS_ONLY __R_FN_PARAMS void* returnAddress
@@ -490,6 +508,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __R_INTERNAL_FN_PARAMS_ONLY __R_INTERNAL_NOINLINE_FN_PARAMS_ONLY
 #define __R_INTERNAL_FN_CALL __R_INTERNAL_NOINLINE_FN_CALL
 #define __R_INTERNAL_FN_CALL_ONLY __R_INTERNAL_NOINLINE_FN_CALL_ONLY
+#define __R_INTERNAL_REPORT_METHOD __R_INTERNAL_NOINLINE_REPORT_METHOD
+#define __R_INTERNAL_NORET_REPORT_METHOD __R_INTERNAL_NOINLINE_NORET_REPORT_METHOD
+#define __R_CALL_INTERNAL_REPORT __R_CALL_INTERNAL_NOINLINE_REPORT
 #else
 #define __R_INTERNAL_METHOD __R_INTERNAL_INLINE_METHOD
 #define __R_INTERNAL_NORET_METHOD __R_INTERNAL_INLINE_NORET_METHOD
@@ -498,6 +519,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __R_INTERNAL_FN_PARAMS_ONLY __R_INTERNAL_INLINE_FN_PARAMS_ONLY
 #define __R_INTERNAL_FN_CALL __R_INTERNAL_INLINE_FN_CALL
 #define __R_INTERNAL_FN_CALL_ONLY __R_INTERNAL_INLINE_FN_CALL_ONLY
+#define __R_INTERNAL_REPORT_METHOD __R_INTERNAL_INLINE_REPORT_METHOD
+#define __R_INTERNAL_NORET_REPORT_METHOD __R_INTERNAL_INLINE_NORET_REPORT_METHOD
+#define __R_CALL_INTERNAL_REPORT __R_CALL_INTERNAL_INLINE_REPORT
 #endif
 // 3) Conditional Methods
 //      * Called Directly by Macros
@@ -531,6 +555,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __R_CONDITIONAL_FN_CALL_ONLY __R_CONDITIONAL_NOINLINE_FN_CALL_ONLY
 #define __R_CONDITIONAL_LAZY_LOCALS void* const returnAddress = _ReturnAddress()
 #define __R_CONDITIONAL_LAZY_FN_CALL __R_FN_CALL returnAddress __R_COMMA
+#define __R_CONDITIONAL_LAZY_FIELDS __R_FN_FIELDS void* m_returnAddress;
+#define __R_CONDITIONAL_LAZY_FIELDS_CALL(reporter) __R_FN_FIELDS_CALL(reporter) reporter.m_returnAddress __R_COMMA
+#define __R_CONDITIONAL_LAZY_REPORT_FN_CALL __R_FN_CALL returnAddress __R_COMMA
 #else
 #define __R_CONDITIONAL_METHOD __R_CONDITIONAL_INLINE_METHOD
 #define __R_CONDITIONAL_TEMPLATE_METHOD __R_CONDITIONAL_INLINE_TEMPLATE_METHOD
@@ -538,6 +565,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __R_CONDITIONAL_FN_CALL_ONLY __R_CONDITIONAL_INLINE_FN_CALL_ONLY
 #define __R_CONDITIONAL_LAZY_LOCALS
 #define __R_CONDITIONAL_LAZY_FN_CALL __R_FN_CALL
+#define __R_CONDITIONAL_LAZY_FIELDS __R_FN_FIELDS
+#define __R_CONDITIONAL_LAZY_FIELDS_CALL(reporter) __R_FN_FIELDS_CALL(reporter)
+#define __R_CONDITIONAL_LAZY_REPORT_FN_CALL __R_FN_CALL _ReturnAddress() __R_COMMA
 #endif
 #define __R_CONDITIONAL_FN_PARAMS __R_FN_PARAMS
 #define __R_CONDITIONAL_FN_PARAMS_ONLY __R_FN_PARAMS_ONLY
@@ -546,6 +576,10 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __R_NS_ASSEMBLE(ri, rd) __R_NS_ASSEMBLE2(ri, rd)
 #define __R_NS_NAME __R_NS_ASSEMBLE(RESULT_INLINE_ERROR_TESTS, RESULT_DIAGNOSTICS_LEVEL)
 #define __R_NS wil::details::__R_NS_NAME
+#define __R_LAZY_NS_ASSEMBLE2(ca) lazyca##ca // The fields of a reporter (__WI_MSG_ARGS) depend on the caller address too
+#define __R_LAZY_NS_ASSEMBLE(ca) __R_LAZY_NS_ASSEMBLE2(ca)
+#define __R_LAZY_NS_NAME __R_LAZY_NS_ASSEMBLE(RESULT_INCLUDE_CALLER_RETURNADDRESS)
+#define __R_LAZY_REPORTER_TYPE(ReporterName) __R_NS::__R_LAZY_NS_NAME::ReporterName
 #if (RESULT_DIAGNOSTICS_LEVEL == 1)
 #define __R_FN(MethodName) __R_NS::MethodName<__COUNTER__>
 #else
@@ -633,6 +667,15 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __RFF_FN_UNREFERENCED \
     __RFF_IF_CALLERADDRESS(callerReturnAddress;) \
     __RFF_IF_LINE(lineNumber;) __RFF_IF_FILE(fileName;) __RFF_IF_FUNCTION(functionName;) __RFF_IF_CODE(code;)
+#define __RFF_FN_FIELDS \
+    __RFF_IF_CALLERADDRESS(void* m_callerReturnAddress;) \
+    __RFF_IF_LINE(unsigned int m_lineNumber;) \
+    __RFF_IF_FILE(PCSTR m_fileName;) __RFF_IF_FUNCTION(PCSTR m_functionName;) __RFF_IF_CODE(PCSTR m_code;)
+#define __RFF_FN_FIELDS_CALL(reporter) \
+    __RFF_IF_CALLERADDRESS(reporter.m_callerReturnAddress __RFF_IF_COMMA) \
+    __RFF_IF_LINE(reporter.m_lineNumber) \
+    __RFF_IF_FILE(__RFF_COMMA reporter.m_fileName) \
+    __RFF_IF_FUNCTION(__RFF_COMMA reporter.m_functionName) __RFF_IF_CODE(__RFF_COMMA reporter.m_code) __RFF_IF_TRAIL_COMMA
 // 1) Direct Methods
 //      * Called Directly by Macros
 //      * Always noinline
@@ -666,13 +709,26 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     template <unsigned int optimizerCounter> \
     inline __declspec(noinline) RESULT_NORETURN void MethodName
 #define __RFF_CALL_INTERNAL_INLINE_METHOD(MethodName) MethodName<optimizerCounter>
+#define __RFF_INTERNAL_INLINE_REPORT_METHOD(MethodName) \
+    template <unsigned int optimizerCounter> \
+    static __declspec(noinline) void MethodName
+#define __RFF_INTERNAL_INLINE_NORET_REPORT_METHOD(MethodName) \
+    template <unsigned int optimizerCounter> \
+    static __declspec(noinline) RESULT_NORETURN void MethodName
+#define __RFF_CALL_INTERNAL_INLINE_REPORT(ReporterType, MethodName) ReporterType::template MethodName<__COUNTER__>
 #else
 #define __RFF_INTERNAL_NOINLINE_METHOD(MethodName) inline void MethodName
 #define __RFF_INTERNAL_NOINLINE_NORET_METHOD(MethodName) inline RESULT_NORETURN void MethodName
 #define __RFF_INTERNAL_INLINE_METHOD(MethodName) inline __declspec(noinline) void MethodName
 #define __RFF_INTERNAL_INLINE_NORET_METHOD(MethodName) inline __declspec(noinline) RESULT_NORETURN void MethodName
 #define __RFF_CALL_INTERNAL_INLINE_METHOD(MethodName) MethodName
+#define __RFF_INTERNAL_INLINE_REPORT_METHOD(MethodName) static __declspec(noinline) void MethodName
+#define __RFF_INTERNAL_INLINE_NORET_REPORT_METHOD(MethodName) static __declspec(noinline) RESULT_NORETURN void MethodName
+#define __RFF_CALL_INTERNAL_INLINE_REPORT(ReporterType, MethodName) ReporterType::MethodName
 #endif
+#define __RFF_INTERNAL_NOINLINE_REPORT_METHOD(MethodName) static void MethodName
+#define __RFF_INTERNAL_NOINLINE_NORET_REPORT_METHOD(MethodName) static RESULT_NORETURN void MethodName
+#define __RFF_CALL_INTERNAL_NOINLINE_REPORT(ReporterType, MethodName) ReporterType::MethodName
 #define __RFF_CALL_INTERNAL_NOINLINE_METHOD(MethodName) MethodName
 #define __RFF_INTERNAL_NOINLINE_FN_PARAMS __RFF_FN_PARAMS void* returnAddress __RFF_COMMA
 #define __RFF_INTERNAL_NOINLINE_FN_PARAMS_ONLY __RFF_FN_PARAMS void* returnAddress
@@ -690,6 +746,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __RFF_INTERNAL_FN_PARAMS_ONLY __RFF_INTERNAL_NOINLINE_FN_PARAMS_ONLY
 #define __RFF_INTERNAL_FN_CALL __RFF_INTERNAL_NOINLINE_FN_CALL
 #define __RFF_INTERNAL_FN_CALL_ONLY __RFF_INTERNAL_NOINLINE_FN_CALL_ONLY
+#define __RFF_INTERNAL_REPORT_METHOD __RFF_INTERNAL_NOINLINE_REPORT_METHOD
+#define __RFF_INTERNAL_NORET_REPORT_METHOD __RFF_INTERNAL_NOINLINE_NORET_REPORT_METHOD
+#define __RFF_CALL_INTERNAL_REPORT __RFF_CALL_INTERNAL_NOINLINE_REPORT
 #else
 #define __RFF_INTERNAL_METHOD __RFF_INTERNAL_INLINE_METHOD
 #define __RFF_INTERNAL_NORET_METHOD __RFF_INTERNAL_INLINE_NORET_METHOD
@@ -698,6 +757,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __RFF_INTERNAL_FN_PARAMS_ONLY __RFF_INTERNAL_INLINE_FN_PARAMS_ONLY
 #define __RFF_INTERNAL_FN_CALL __RFF_INTERNAL_INLINE_FN_CALL
 #define __RFF_INTERNAL_FN_CALL_ONLY __RFF_INTERNAL_INLINE_FN_CALL_ONLY
+#define __RFF_INTERNAL_REPORT_METHOD __RFF_INTERNAL_INLINE_REPORT_METHOD
+#define __RFF_INTERNAL_NORET_REPORT_METHOD __RFF_INTERNAL_INLINE_NORET_REPORT_METHOD
+#define __RFF_CALL_INTERNAL_REPORT __RFF_CALL_INTERNAL_INLINE_REPORT
 #endif
 // 3) Conditional Methods
 //      * Called Directly by Macros
@@ -731,6 +793,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __RFF_CONDITIONAL_FN_CALL_ONLY __RFF_CONDITIONAL_NOINLINE_FN_CALL_ONLY
 #define __RFF_CONDITIONAL_LAZY_LOCALS void* const returnAddress = _ReturnAddress()
 #define __RFF_CONDITIONAL_LAZY_FN_CALL __RFF_FN_CALL returnAddress __RFF_COMMA
+#define __RFF_CONDITIONAL_LAZY_FIELDS __RFF_FN_FIELDS void* m_returnAddress;
+#define __RFF_CONDITIONAL_LAZY_FIELDS_CALL(reporter) __RFF_FN_FIELDS_CALL(reporter) reporter.m_returnAddress __RFF_COMMA
+#define __RFF_CONDITIONAL_LAZY_REPORT_FN_CALL __RFF_FN_CALL returnAddress __RFF_COMMA
 #else
 #define __RFF_CONDITIONAL_METHOD __RFF_CONDITIONAL_INLINE_METHOD
 #define __RFF_CONDITIONAL_TEMPLATE_METHOD __RFF_CONDITIONAL_INLINE_TEMPLATE_METHOD
@@ -738,6 +803,9 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __RFF_CONDITIONAL_FN_CALL_ONLY __RFF_CONDITIONAL_INLINE_FN_CALL_ONLY
 #define __RFF_CONDITIONAL_LAZY_LOCALS
 #define __RFF_CONDITIONAL_LAZY_FN_CALL __RFF_FN_CALL
+#define __RFF_CONDITIONAL_LAZY_FIELDS __RFF_FN_FIELDS
+#define __RFF_CONDITIONAL_LAZY_FIELDS_CALL(reporter) __RFF_FN_FIELDS_CALL(reporter)
+#define __RFF_CONDITIONAL_LAZY_REPORT_FN_CALL __RFF_FN_CALL _ReturnAddress() __RFF_COMMA
 #endif
 #define __RFF_CONDITIONAL_FN_PARAMS __RFF_FN_PARAMS
 #define __RFF_CONDITIONAL_FN_PARAMS_ONLY __RFF_FN_PARAMS_ONLY
@@ -746,6 +814,10 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __RFF_NS_ASSEMBLE(ri, rd) __RFF_NS_ASSEMBLE2(ri, rd)
 #define __RFF_NS_NAME __RFF_NS_ASSEMBLE(RESULT_INLINE_ERROR_TESTS_FAIL_FAST, RESULT_DIAGNOSTICS_LEVEL_FAIL_FAST)
 #define __RFF_NS wil::details::__RFF_NS_NAME
+#define __RFF_LAZY_NS_ASSEMBLE2(ca) lazyca##ca // The fields of a reporter (__WI_MSG_ARGS) depend on the caller address too
+#define __RFF_LAZY_NS_ASSEMBLE(ca) __RFF_LAZY_NS_ASSEMBLE2(ca)
+#define __RFF_LAZY_NS_NAME __RFF_LAZY_NS_ASSEMBLE(RESULT_INCLUDE_CALLER_RETURNADDRESS_FAIL_FAST)
+#define __RFF_LAZY_REPORTER_TYPE(ReporterName) __RFF_NS::__RFF_LAZY_NS_NAME::ReporterName
 #if (RESULT_DIAGNOSTICS_LEVEL_FAIL_FAST == 1)
 #define __RFF_FN(MethodName) __RFF_NS::MethodName<__COUNTER__>
 #else
@@ -765,9 +837,10 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // The message of a conditional LOG_XXX_MSG, FAIL_FAST_XXX_MSG or THROW_XXX_MSG macro (see RESULT_LAZY_MESSAGE_ARGUMENTS
 // above): the format string and its arguments when the setting is 0, as for the other _MSG macros; when it is 1, a
-// lambda that the conditional method calls only when the check fails, with the reporter to which it passes them. Under
-// clang before C++20, the capture of a structured binding named in a message argument is an extension, whose warning
-// (-Wc++20-extensions, on by default) is silenced inside the message.
+// lambda that the conditional method calls only when the check fails, with a reporter ('reporter', in the macro's
+// family: __R or __RFF) and 'true', and that passes them, as var-args, to the reporter's Report (see the conditional
+// methods of the LOG_XXX_MSG macros). Under clang before C++20, the capture of a structured binding named in a message
+// argument is an extension, whose warning (-Wc++20-extensions, on by default) is silenced inside the message.
 #if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
 #if defined(__clang__) && defined(__has_warning)
 #if __has_warning("-Wc++20-extensions")
@@ -780,13 +853,17 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __WI_MSG_ARGS_WARNINGS_E
 #endif
 // clang-format off
-#define __WI_MSG_ARGS(fmt, ...) \
-    __WI_MSG_ARGS_WARNINGS_S [&](const auto& __wilReport) { \
-        __wilReport(__WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)); \
+#define __WI_MSG_ARGS(family, reporter, fmt, ...) \
+    __WI_MSG_ARGS_WARNINGS_S [&](const family##_LAZY_REPORTER_TYPE(reporter) & __wilReport, bool __wilFailed) { \
+        if (__wilFailed) \
+        { \
+            family##_CALL_INTERNAL_REPORT(family##_LAZY_REPORTER_TYPE(reporter), Report)( \
+                family##_CONDITIONAL_LAZY_FIELDS_CALL(__wilReport) __wilReport.m_value, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)); \
+        } \
     } __WI_MSG_ARGS_WARNINGS_E
 // clang-format on
 #else
-#define __WI_MSG_ARGS(fmt, ...) __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)
+#define __WI_MSG_ARGS(family, reporter, fmt, ...) __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)
 #endif
 
 // Helpers for return macros
@@ -1283,23 +1360,26 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally logs failures - returns parameter value - logs a var-arg message on failure
 #define LOG_IF_FAILED_MSG(hr, fmt, ...) \
-    __R_FN(Log_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(__R, _Log_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define LOG_IF_WIN32_BOOL_FALSE_MSG(win32BOOL, fmt, ...) \
-    __R_FN(Log_IfWin32BoolFalseMsg)(__R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfWin32BoolFalseMsg)( \
+        __R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(__R, _Log_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define LOG_IF_WIN32_ERROR_MSG(win32err, fmt, ...) \
-    __R_FN(Log_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
-#define LOG_IF_NULL_ALLOC_MSG(ptr, fmt, ...) __R_FN(Log_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_MSG_ARGS(__R, _Log_Win32MsgLazyReporter, fmt, ##__VA_ARGS__))
+#define LOG_IF_NULL_ALLOC_MSG(ptr, fmt, ...) \
+    __R_FN(Log_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(__R, _Log_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define LOG_HR_IF_MSG(hr, condition, fmt, ...) \
     __R_FN(Log_HrIfMsg) \
-    (__R_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    (__R_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_MSG_ARGS(__R, _Log_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define LOG_HR_IF_NULL_MSG(hr, ptr, fmt, ...) \
-    __R_FN(Log_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Log_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(__R, _Log_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define LOG_LAST_ERROR_IF_MSG(condition, fmt, ...) \
-    __R_FN(Log_GetLastErrorIfMsg)(__R_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Log_GetLastErrorIfMsg)( \
+        __R_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(__R, _Log_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define LOG_LAST_ERROR_IF_NULL_MSG(ptr, fmt, ...) \
-    __R_FN(Log_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Log_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(__R, _Log_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define LOG_IF_NTSTATUS_FAILED_MSG(status, fmt, ...) \
-    __R_FN(Log_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_MSG_ARGS(__R, _Log_NtStatusMsgLazyReporter, fmt, ##__VA_ARGS__))
 
 /// @cond
 #define __WI_COMMA_EXPECTED_HRESULT(e) , wil::verify_hresult(e)
@@ -1345,26 +1425,33 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally fail fast failures - returns parameter value - fail fast a var-arg message on failure
 #define FAIL_FAST_IF_FAILED_MSG(hr, fmt, ...) \
-    __RFF_FN(FailFast_IfFailedMsg)(__RFF_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfFailedMsg)( \
+        __RFF_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(__RFF, _FailFast_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_WIN32_BOOL_FALSE_MSG(win32BOOL, fmt, ...) \
     __RFF_FN(FailFast_IfWin32BoolFalseMsg) \
-    (__RFF_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    (__RFF_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(__RFF, _FailFast_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_WIN32_ERROR_MSG(win32err, fmt, ...) \
-    __RFF_FN(FailFast_IfWin32ErrorMsg)(__RFF_INFO(#win32err) win32err, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfWin32ErrorMsg)( \
+        __RFF_INFO(#win32err) win32err, __WI_MSG_ARGS(__RFF, _FailFast_Win32MsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_NULL_ALLOC_MSG(ptr, fmt, ...) \
-    __RFF_FN(FailFast_IfNullAllocMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfNullAllocMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(__RFF, _FailFast_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_HR_IF_MSG(hr, condition, fmt, ...) \
     __RFF_FN(FailFast_HrIfMsg) \
-    (__RFF_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    (__RFF_INFO(#condition) wil::verify_hresult(hr), \
+     wil::verify_bool(condition), \
+     __WI_MSG_ARGS(__RFF, _FailFast_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_HR_IF_NULL_MSG(hr, ptr, fmt, ...) \
-    __RFF_FN(FailFast_HrIfNullMsg)(__RFF_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_HrIfNullMsg)( \
+        __RFF_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(__RFF, _FailFast_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_LAST_ERROR_IF_MSG(condition, fmt, ...) \
     __RFF_FN(FailFast_GetLastErrorIfMsg) \
-    (__RFF_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    (__RFF_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(__RFF, _FailFast_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_LAST_ERROR_IF_NULL_MSG(ptr, fmt, ...) \
-    __RFF_FN(FailFast_GetLastErrorIfNullMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_GetLastErrorIfNullMsg)( \
+        __RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(__RFF, _FailFast_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_NTSTATUS_FAILED_MSG(status, fmt, ...) \
-    __RFF_FN(FailFast_IfNtStatusFailedMsg)(__RFF_INFO(#status) status, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfNtStatusFailedMsg)( \
+        __RFF_INFO(#status) status, __WI_MSG_ARGS(__RFF, _FailFast_NtStatusMsgLazyReporter, fmt, ##__VA_ARGS__))
 
 // Always fail fast a known failure
 #ifndef FAIL_FAST
@@ -1380,8 +1467,10 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally fail fast failures - returns parameter value - fail fast a var-arg message on failure
 #define FAIL_FAST_IF_MSG(condition, fmt, ...) \
-    __RFF_FN(FailFast_IfMsg)(__RFF_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
-#define FAIL_FAST_IF_NULL_MSG(ptr, fmt, ...) __RFF_FN(FailFast_IfNullMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfMsg)( \
+        __RFF_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(__RFF, _FailFast_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
+#define FAIL_FAST_IF_NULL_MSG(ptr, fmt, ...) \
+    __RFF_FN(FailFast_IfNullMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(__RFF, _FailFast_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 
 // Immediate fail fast (no telemetry - use rarely / only when *already* in an undefined state)
 #define FAIL_FAST_IMMEDIATE() __RFF_FN(FailFastImmediate_Unexpected)()
@@ -1461,26 +1550,33 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally throw failures - returns parameter value - throw a var-arg message on failure
 #define THROW_IF_FAILED_MSG(hr, fmt, ...) \
-    __R_FN(Throw_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(__R, _Throw_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_IF_WIN32_BOOL_FALSE_MSG(win32BOOL, fmt, ...) \
-    __R_FN(Throw_IfWin32BoolFalseMsg)(__R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfWin32BoolFalseMsg)( \
+        __R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(__R, _Throw_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_IF_WIN32_ERROR_MSG(win32err, fmt, ...) \
-    __R_FN(Throw_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
-#define THROW_IF_NULL_ALLOC_MSG(ptr, fmt, ...) __R_FN(Throw_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_MSG_ARGS(__R, _Throw_Win32MsgLazyReporter, fmt, ##__VA_ARGS__))
+#define THROW_IF_NULL_ALLOC_MSG(ptr, fmt, ...) \
+    __R_FN(Throw_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(__R, _Throw_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_HR_IF_MSG(hr, condition, fmt, ...) \
     __R_FN(Throw_HrIfMsg) \
-    (__R_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    (__R_INFO(#condition) wil::verify_hresult(hr), \
+     wil::verify_bool(condition), \
+     __WI_MSG_ARGS(__R, _Throw_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_HR_IF_NULL_MSG(hr, ptr, fmt, ...) \
-    __R_FN(Throw_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(__R, _Throw_HrMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_WIN32_IF_MSG(win32err, condition, fmt, ...) \
     __R_FN(Throw_Win32IfMsg) \
-    (__R_INFO(#condition) wil::verify_win32(win32err), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    (__R_INFO(#condition) wil::verify_win32(win32err), \
+     wil::verify_bool(condition), \
+     __WI_MSG_ARGS(__R, _Throw_Win32MsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_LAST_ERROR_IF_MSG(condition, fmt, ...) \
-    __R_FN(Throw_GetLastErrorIfMsg)(__R_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_GetLastErrorIfMsg)( \
+        __R_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(__R, _Throw_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_LAST_ERROR_IF_NULL_MSG(ptr, fmt, ...) \
-    __R_FN(Throw_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(__R, _Throw_GetLastErrorMsgLazyReporter, fmt, ##__VA_ARGS__))
 #define THROW_IF_NTSTATUS_FAILED_MSG(status, fmt, ...) \
-    __R_FN(Throw_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_MSG_ARGS(__R, _Throw_NtStatusMsgLazyReporter, fmt, ##__VA_ARGS__))
 
 //*****************************************************************************
 // Macros to catch and convert exceptions on failure
@@ -6061,96 +6157,83 @@ namespace details
 
 #if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
         // The conditional methods of the LOG_XXX_MSG macros when RESULT_LAZY_MESSAGE_ARGUMENTS is 1. 'format' is the
-        // lambda of the macro (see __WI_MSG_ARGS), which the method calls only when the check fails, with a reporter:
-        // the lambda then evaluates the format string and its arguments and passes them to the reporter, which passes
-        // them on, with the diagnostics, to an internal method that takes them as var-args. A reporter is the lambda
-        // of a ...Reporter function below, which does not depend on the macro's lambda, so that the uses of the
-        // macros share its call operators (which compiles faster). It captures by value: by reference, PREfast would
-        // assume that the parameters of the conditional method may change, and could not prove its _Post_satisfies_
-        // annotation. It tests 'failed', always true, so that neither lambda is a function that never returns:
-        // compilers do not inline a call to one (the call is cold), which would leave both lambdas out of line at
-        // each use of a FAIL_FAST_ or THROW_ macro, and the variables they capture in memory. Once the lambdas are
-        // inlined, the test folds away.
-        __R_INTERNAL_METHOD(_Log_HrMsgLazy)
-        (__R_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        // lambda of the macro (see __WI_MSG_ARGS), which the method calls only when the check fails, with a reporter
+        // and 'true'. A reporter holds the diagnostics and the value to report. The lambda passes them, and the format
+        // string and its arguments as var-args, to the reporter's Report, which passes them on, as the var-arg
+        // conditional method does, to the internal method of the macro. As var-args, the arguments keep what they mean
+        // with the setting at 0: a constant named in one is not odr-used, so that a lambda or a local class in which
+        // the macro is used need not capture it, and PREfast checks the format string against them. Report is not
+        // inlined; with RESULT_INLINE_ERROR_TESTS 1, it takes the return address that it reports, which is in the
+        // lambda (and so in the function that uses the macro, once the lambda is inlined). Once the lambda is inlined,
+        // the reporter is gone: its fields are passed as arguments, as they are to the internal methods.
+        //
+        // The macro names the type of the reporter, so that its lambda is not generic: in a generic lambda, the call
+        // to Report would be a dependent call, which MSVC 19.51 does not compile (C1001, an internal compiler error)
+        // when it names a constexpr pointer that the lambda cannot capture. With RESULT_DIAGNOSTICS_LEVEL 1 and
+        // RESULT_INLINE_ERROR_TESTS 1, Report is a template, so that each use of a macro calls a function of its own,
+        // as it does an internal method. The lambda tests its second parameter, always true, so that it is not a
+        // function that never returns when Report does not (FAIL_FAST_ and THROW_): compilers do not inline a call to
+        // one (the call is cold), which would leave the lambda out of line at each use and the variables it captures
+        // in memory. Once the lambda is inlined, the test folds away.
+        namespace __R_LAZY_NS_NAME
         {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            wil::details::ReportFailure_HrMsg<FailureType::Log>(__R_INTERNAL_FN_CALL hr, formatString, argList);
-        }
+            struct _Log_HrMsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                HRESULT m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_HrMsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS HRESULT hr, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __R_CALL_INTERNAL_METHOD(_Log_HrMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL hr, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Log_HrMsg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL hr, formatString, argList);
                 }
             };
-        }
 
-        __R_INTERNAL_METHOD(_Log_GetLastErrorMsgLazy)
-        (__R_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            ::SetLastError(lastError); // The message arguments ran after the conditional method read it
-            wil::details::ReportFailure_GetLastErrorMsg<FailureType::Log>(__R_INTERNAL_FN_CALL formatString, argList);
-        }
+            struct _Log_GetLastErrorMsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                DWORD m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_GetLastErrorMsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS DWORD lastError, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __R_CALL_INTERNAL_METHOD(_Log_GetLastErrorMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL lastError, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    ::SetLastError(lastError); // The message arguments ran after the conditional method read it
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Log_GetLastErrorMsg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL formatString, argList);
                 }
             };
-        }
 
-        __R_INTERNAL_METHOD(_Log_Win32MsgLazy)
-        (__R_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            wil::details::ReportFailure_Win32Msg<FailureType::Log>(__R_INTERNAL_FN_CALL err, formatString, argList);
-        }
+            struct _Log_Win32MsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                DWORD m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_Win32MsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS DWORD err, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __R_CALL_INTERNAL_METHOD(_Log_Win32MsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL err, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Log_Win32Msg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL err, formatString, argList);
                 }
             };
-        }
 
-        __R_INTERNAL_METHOD(_Log_NtStatusMsgLazy)
-        (__R_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            wil::details::ReportFailure_NtStatusMsg<FailureType::Log>(__R_INTERNAL_FN_CALL status, formatString, argList);
-        }
+            struct _Log_NtStatusMsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                NTSTATUS m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_NtStatusMsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS NTSTATUS status, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __R_CALL_INTERNAL_METHOD(_Log_NtStatusMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL status, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Log_NtStatusMsg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL status, formatString, argList);
                 }
             };
-        }
+        } // namespace __R_LAZY_NS_NAME
 
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
         _Post_satisfies_(return == hr)
@@ -6159,7 +6242,7 @@ namespace details
             if (FAILED(hr)) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Log_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
             }
             return hr;
         }
@@ -6172,7 +6255,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Log_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
             }
             return ret;
         }
@@ -6184,7 +6267,7 @@ namespace details
             if (FAILED_WIN32(err)) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_Win32MsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL err, true));
+                format(__R_LAZY_NS_NAME::_Log_Win32MsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL err}, true);
             }
             return err;
         }
@@ -6196,7 +6279,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                format(__R_LAZY_NS_NAME::_Log_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY}, true);
             }
             return pointer;
         }
@@ -6207,7 +6290,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                format(__R_LAZY_NS_NAME::_Log_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY}, true);
             }
         }
 
@@ -6218,7 +6301,7 @@ namespace details
             if (condition) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Log_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
             }
             return condition;
         }
@@ -6230,7 +6313,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Log_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
             }
             return pointer;
         }
@@ -6242,7 +6325,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Log_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
             }
         }
 
@@ -6254,7 +6337,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Log_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
             }
             return condition;
         }
@@ -6267,7 +6350,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Log_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
             }
             return pointer;
         }
@@ -6280,7 +6363,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Log_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
             }
         }
 
@@ -6291,7 +6374,7 @@ namespace details
             if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_NtStatusMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL status, true));
+                format(__R_LAZY_NS_NAME::_Log_NtStatusMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL status}, true);
             }
             return status;
         }
@@ -6973,88 +7056,68 @@ namespace details
 
 #if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
         // The conditional methods of the FAIL_FAST_XXX_MSG macros when RESULT_LAZY_MESSAGE_ARGUMENTS is 1: see those of the
-        // LOG_XXX_MSG macros above.
-        __RFF_INTERNAL_NORET_METHOD(_FailFast_HrMsgLazy)
-        (__RFF_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        // LOG_XXX_MSG macros above. Report does not return (RESULT_NORETURN).
+        namespace __RFF_LAZY_NS_NAME
         {
-            va_list argList;
-            va_start(argList, formatString);
-            __RFF_FN_LOCALS;
-            wil::details::ReportFailure_HrMsg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL hr, formatString, argList);
-        }
+            struct _FailFast_HrMsgLazyReporter
+            {
+                __RFF_CONDITIONAL_LAZY_FIELDS
+                HRESULT m_value;
 
-        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_HrMsgLazyReporter)
-        (__RFF_INTERNAL_FN_PARAMS HRESULT hr, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __RFF_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__RFF_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __RFF_CALL_INTERNAL_METHOD(_FailFast_HrMsgLazy)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __RFF_CALL_INTERNAL_NOINLINE_METHOD(_FailFast_HrMsg)(__RFF_CONDITIONAL_LAZY_REPORT_FN_CALL hr, formatString, argList);
                 }
             };
-        }
 
-        __RFF_INTERNAL_NORET_METHOD(_FailFast_GetLastErrorMsgLazy)
-        (__RFF_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __RFF_FN_LOCALS;
-            ::SetLastError(lastError); // The message arguments ran after the conditional method read it
-            wil::details::ReportFailure_GetLastErrorMsg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL formatString, argList);
-        }
+            struct _FailFast_GetLastErrorMsgLazyReporter
+            {
+                __RFF_CONDITIONAL_LAZY_FIELDS
+                DWORD m_value;
 
-        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_GetLastErrorMsgLazyReporter)
-        (__RFF_INTERNAL_FN_PARAMS DWORD lastError, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __RFF_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__RFF_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastErrorMsgLazy)(
-                        __RFF_CONDITIONAL_LAZY_FN_CALL lastError, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    ::SetLastError(lastError); // The message arguments ran after the conditional method read it
+                    __RFF_CALL_INTERNAL_NOINLINE_METHOD(_FailFast_GetLastErrorMsg)(
+                        __RFF_CONDITIONAL_LAZY_REPORT_FN_CALL formatString, argList);
                 }
             };
-        }
 
-        __RFF_INTERNAL_NORET_METHOD(_FailFast_Win32MsgLazy)
-        (__RFF_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __RFF_FN_LOCALS;
-            wil::details::ReportFailure_Win32Msg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL err, formatString, argList);
-        }
+            struct _FailFast_Win32MsgLazyReporter
+            {
+                __RFF_CONDITIONAL_LAZY_FIELDS
+                DWORD m_value;
 
-        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_Win32MsgLazyReporter)
-        (__RFF_INTERNAL_FN_PARAMS DWORD err, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __RFF_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__RFF_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __RFF_CALL_INTERNAL_METHOD(_FailFast_Win32MsgLazy)(__RFF_CONDITIONAL_LAZY_FN_CALL err, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __RFF_CALL_INTERNAL_NOINLINE_METHOD(_FailFast_Win32Msg)(__RFF_CONDITIONAL_LAZY_REPORT_FN_CALL err, formatString, argList);
                 }
             };
-        }
 
-        __RFF_INTERNAL_NORET_METHOD(_FailFast_NtStatusMsgLazy)
-        (__RFF_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __RFF_FN_LOCALS;
-            wil::details::ReportFailure_NtStatusMsg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL status, formatString, argList);
-        }
+            struct _FailFast_NtStatusMsgLazyReporter
+            {
+                __RFF_CONDITIONAL_LAZY_FIELDS
+                NTSTATUS m_value;
 
-        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_NtStatusMsgLazyReporter)
-        (__RFF_INTERNAL_FN_PARAMS NTSTATUS status, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __RFF_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__RFF_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
                 {
-                    __RFF_CALL_INTERNAL_METHOD(_FailFast_NtStatusMsgLazy)(__RFF_CONDITIONAL_LAZY_FN_CALL status, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __RFF_CALL_INTERNAL_NOINLINE_METHOD(_FailFast_NtStatusMsg)(
+                        __RFF_CONDITIONAL_LAZY_REPORT_FN_CALL status, formatString, argList);
                 }
             };
-        }
+        } // namespace __RFF_LAZY_NS_NAME
 
         template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
         _Post_satisfies_(return == hr) _When_(FAILED(hr), _Analysis_noreturn_)
@@ -7064,7 +7127,7 @@ namespace details
             if (FAILED(hr)) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return hr;
@@ -7079,8 +7142,7 @@ namespace details
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
-                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_GetLastErrorMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return ret;
@@ -7094,7 +7156,7 @@ namespace details
             if (FAILED_WIN32(err)) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_Win32MsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL err, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_Win32MsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL err}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return err;
@@ -7108,7 +7170,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return pointer;
@@ -7121,7 +7183,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
         }
@@ -7134,7 +7196,7 @@ namespace details
             if (condition) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return condition;
@@ -7148,7 +7210,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return pointer;
@@ -7161,7 +7223,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
         }
@@ -7175,8 +7237,7 @@ namespace details
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
-                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_GetLastErrorMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return condition;
@@ -7191,8 +7252,7 @@ namespace details
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
-                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_GetLastErrorMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return pointer;
@@ -7206,8 +7266,7 @@ namespace details
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
-                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_GetLastErrorMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
         }
@@ -7220,7 +7279,7 @@ namespace details
             if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_NtStatusMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL status, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_NtStatusMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL status}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return status;
@@ -7234,7 +7293,7 @@ namespace details
             if (condition) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return condition;
@@ -7248,7 +7307,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return pointer;
@@ -7261,7 +7320,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CONDITIONAL_LAZY_LOCALS;
-                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED, true));
+                format(__RFF_LAZY_NS_NAME::_FailFast_HrMsgLazyReporter{__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
         }
@@ -7893,87 +7952,66 @@ namespace details
 
 #if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
         // The conditional methods of the THROW_XXX_MSG macros when RESULT_LAZY_MESSAGE_ARGUMENTS is 1: see those of the
-        // LOG_XXX_MSG macros above.
-        __R_INTERNAL_NORET_METHOD(_Throw_HrMsgLazy)
-        (__R_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...)
+        // LOG_XXX_MSG macros above. Report does not return (RESULT_NORETURN).
+        namespace __R_LAZY_NS_NAME
         {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            wil::details::ReportFailure_HrMsg<FailureType::Exception>(__R_INTERNAL_FN_CALL hr, formatString, argList);
-        }
+            struct _Throw_HrMsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                HRESULT m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_HrMsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS HRESULT hr, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...)
                 {
-                    __R_CALL_INTERNAL_METHOD(_Throw_HrMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL hr, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Throw_HrMsg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL hr, formatString, argList);
                 }
             };
-        }
 
-        __R_INTERNAL_NORET_METHOD(_Throw_GetLastErrorMsgLazy)
-        (__R_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...)
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            ::SetLastError(lastError); // The message arguments ran after the conditional method read it
-            wil::details::ReportFailure_GetLastErrorMsg<FailureType::Exception>(__R_INTERNAL_FN_CALL formatString, argList);
-        }
+            struct _Throw_GetLastErrorMsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                DWORD m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_GetLastErrorMsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS DWORD lastError, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...)
                 {
-                    __R_CALL_INTERNAL_METHOD(_Throw_GetLastErrorMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL lastError, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    ::SetLastError(lastError); // The message arguments ran after the conditional method read it
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Throw_GetLastErrorMsg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL formatString, argList);
                 }
             };
-        }
 
-        __R_INTERNAL_NORET_METHOD(_Throw_Win32MsgLazy)
-        (__R_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...)
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            wil::details::ReportFailure_Win32Msg<FailureType::Exception>(__R_INTERNAL_FN_CALL err, formatString, argList);
-        }
+            struct _Throw_Win32MsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                DWORD m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_Win32MsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS DWORD err, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...)
                 {
-                    __R_CALL_INTERNAL_METHOD(_Throw_Win32MsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL err, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Throw_Win32Msg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL err, formatString, argList);
                 }
             };
-        }
 
-        __R_INTERNAL_NORET_METHOD(_Throw_NtStatusMsgLazy)
-        (__R_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...)
-        {
-            va_list argList;
-            va_start(argList, formatString);
-            __R_FN_LOCALS;
-            wil::details::ReportFailure_NtStatusMsg<FailureType::Exception>(__R_INTERNAL_FN_CALL status, formatString, argList);
-        }
+            struct _Throw_NtStatusMsgLazyReporter
+            {
+                __R_CONDITIONAL_LAZY_FIELDS
+                NTSTATUS m_value;
 
-        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_NtStatusMsgLazyReporter)
-        (__R_INTERNAL_FN_PARAMS NTSTATUS status, bool failed) WI_NOEXCEPT
-        {
-            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
-                if (failed) // Always true; see above
+                __R_INTERNAL_NORET_REPORT_METHOD(Report)
+                (__R_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...)
                 {
-                    __R_CALL_INTERNAL_METHOD(_Throw_NtStatusMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL status, formatString, args...);
+                    va_list argList;
+                    va_start(argList, formatString);
+                    __R_CALL_INTERNAL_NOINLINE_METHOD(_Throw_NtStatusMsg)(__R_CONDITIONAL_LAZY_REPORT_FN_CALL status, formatString, argList);
                 }
             };
-        }
+        } // namespace __R_LAZY_NS_NAME
 
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
         _Post_satisfies_(return == hr) _When_(FAILED(hr), _Analysis_noreturn_)
@@ -7983,7 +8021,7 @@ namespace details
             if (FAILED(hr)) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Throw_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return hr;
@@ -7998,7 +8036,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Throw_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return ret;
@@ -8012,7 +8050,7 @@ namespace details
             if (FAILED_WIN32(err)) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_Win32MsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL err, true));
+                format(__R_LAZY_NS_NAME::_Throw_Win32MsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL err}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return err;
@@ -8026,7 +8064,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                format(__R_LAZY_NS_NAME::_Throw_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return pointer;
@@ -8040,7 +8078,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                format(__R_LAZY_NS_NAME::_Throw_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
         }
@@ -8053,7 +8091,7 @@ namespace details
             if (condition) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Throw_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return condition;
@@ -8067,7 +8105,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Throw_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return pointer;
@@ -8081,7 +8119,7 @@ namespace details
             if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                format(__R_LAZY_NS_NAME::_Throw_HrMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL hr}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
         }
@@ -8094,7 +8132,7 @@ namespace details
             if (condition) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_Win32MsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL err, true));
+                format(__R_LAZY_NS_NAME::_Throw_Win32MsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL err}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return condition;
@@ -8109,7 +8147,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Throw_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return condition;
@@ -8124,7 +8162,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Throw_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return pointer;
@@ -8139,7 +8177,7 @@ namespace details
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
                 const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                format(__R_LAZY_NS_NAME::_Throw_GetLastErrorMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL lastError}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
         }
@@ -8152,7 +8190,7 @@ namespace details
             if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
             {
                 __R_CONDITIONAL_LAZY_LOCALS;
-                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_NtStatusMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL status, true));
+                format(__R_LAZY_NS_NAME::_Throw_NtStatusMsgLazyReporter{__R_CONDITIONAL_LAZY_FN_CALL status}, true);
                 __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
             }
             return status;

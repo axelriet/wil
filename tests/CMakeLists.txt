@@ -180,7 +180,7 @@ endif()
 # LazyMessageArgumentsStdcallTests.cpp is built without the precompiled header, and on x86 with another default calling
 # convention than the other sources (/Gz), so that units built with different defaults report failures through the same
 # macros in one binary
-set(WIL_TEST_DIRECTORIES app cpplatest noexcept normal win7)
+set(WIL_TEST_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}" app cpplatest noexcept normal win7)
 if (${WIL_ENABLE_ASAN})
     list(APPEND WIL_TEST_DIRECTORIES sanitize-address)
 endif()
@@ -198,4 +198,31 @@ endif()
 if (${WIL_ENABLE_UBSAN})
     # TODO: Disabled until https://github.com/microsoft/STL/issues/3568 is resolved
     # add_subdirectory(sanitize-undefined-behavior)
+endif()
+
+# Opt-in focused coverage for the compile-time settings that change lazy reporter types and call sites.
+option(WIL_BUILD_LAZY_MESSAGE_MATRIX "Build lazy-message diagnostic-setting tests" OFF)
+if (WIL_BUILD_LAZY_MESSAGE_MATRIX)
+    foreach (diagnostics RANGE 0 5)
+        foreach (inline_tests RANGE 0 1)
+            foreach (caller_address RANGE 0 1)
+                math(EXPR fail_fast_diagnostics "5 - ${diagnostics}")
+                math(EXPR fail_fast_inline "1 - ${inline_tests}")
+                math(EXPR fail_fast_caller "1 - ${caller_address}")
+                set(target "witest.lazy.d${diagnostics}.i${inline_tests}.c${caller_address}")
+                add_executable(${target}
+                    LazyMessageArgumentsTests.cpp
+                    LazyMessageArgumentsStdcallTests.cpp)
+                target_compile_definitions(${target} PRIVATE
+                    RESULT_DIAGNOSTICS_LEVEL=${diagnostics}
+                    RESULT_INLINE_ERROR_TESTS=${inline_tests}
+                    RESULT_INCLUDE_CALLER_RETURNADDRESS=${caller_address}
+                    RESULT_DIAGNOSTICS_LEVEL_FAIL_FAST=${fail_fast_diagnostics}
+                    RESULT_INLINE_ERROR_TESTS_FAIL_FAST=${fail_fast_inline}
+                    RESULT_INCLUDE_CALLER_RETURNADDRESS_FAIL_FAST=${fail_fast_caller})
+                add_test(NAME ${target} COMMAND $<TARGET_FILE:${target}>)
+                set_tests_properties(${target} PROPERTIES LABELS "lazy-message")
+            endforeach()
+        endforeach()
+    endforeach()
 endif()

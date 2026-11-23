@@ -170,6 +170,17 @@ C:\wil> cmake --build --preset "msvc-release" --clean-first --target "witest"
 C:\wil> ctest --preset "msvc-release"
 ```
 
+The optional lazy-message matrix exercises all 24 combinations of diagnostic level (0 through 5), inline error tests,
+and caller-address inclusion. Fail-fast settings use complementary values to cover independently configured reporters.
+It reuses the lazy-message tests, including cross-translation-unit member functions built with different default
+calling conventions on x86. The matrix is disabled by default. To build and run it with MSVC:
+
+```powershell
+cmake --preset msvc -DWIL_BUILD_LAZY_MESSAGE_MATRIX=ON
+cmake --build --preset msvc-debug
+ctest --preset msvc-debug -L lazy-message --output-on-failure
+```
+
 For command-line Ninja (configured with `init.cmd -c clang -b debug`) build use, some examples:
 ```powershell
 # Build all tests

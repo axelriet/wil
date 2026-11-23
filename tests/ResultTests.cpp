@@ -1,5 +1,7 @@
 #include "pch.h"
 
+#include <cwchar>
+
 #include <wil/com.h>
 #include <wil/result.h>
 
@@ -824,8 +826,7 @@ TEST_CASE("ResultTests::FailureLogFilePrefix", "[result]")
     REQUIRE_SUCCEEDED(StringCchPrintfW(expected, ARRAYSIZE(expected),
                                       L"formatter.cpp(42): [formatter_module!%p] ReturnHr(7) tid(", failure.returnAddress));
     REQUIRE(wil::GetFailureLogString(message, ARRAYSIZE(message), failure) == S_OK);
-    REQUIRE(lstrlenW(message) >= lstrlenW(expected));
-    REQUIRE(CompareStringOrdinal(message, lstrlenW(expected), expected, -1, FALSE) == CSTR_EQUAL);
+    REQUIRE(std::wcsncmp(message, expected, std::wcslen(expected)) == 0);
 }
 
 TEST_CASE("ResultTests::FailureLogCustomMessage", "[result]")
