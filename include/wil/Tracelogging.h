@@ -176,7 +176,7 @@ enum class ActivityOptions
 };
 DEFINE_ENUM_FLAG_OPERATORS(ActivityOptions)
 
-template <typename ActivityTraceLoggingType, ActivityOptions options, UINT64 keyword, UINT8 level, UINT64 privacyTag, typename TlgReflectorTag>
+template <typename ActivityTraceLoggingType, ActivityOptions options, UINT64 keyword, UINT8 level, UINT64 privacyTag, typename TlgReflectorTag, typename SharedAllocator>
 class ActivityBase;
 
 /// @cond
@@ -374,8 +374,8 @@ namespace details
     }
 
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
-    template <typename ActivityTraceLoggingType, ActivityOptions options, UINT64 keyword, UINT8 level, UINT64 privacyTag, typename TlgReflectorTag>
-    void SetRelatedActivityId(wil::ActivityBase<ActivityTraceLoggingType, options, keyword, level, privacyTag, TlgReflectorTag>& activity)
+    template <typename ActivityTraceLoggingType, ActivityOptions options, UINT64 keyword, UINT8 level, UINT64 privacyTag, typename TlgReflectorTag, typename SharedAllocator>
+    void SetRelatedActivityId(wil::ActivityBase<ActivityTraceLoggingType, options, keyword, level, privacyTag, TlgReflectorTag, SharedAllocator>& activity)
     {
         GUID capturedRelatedId;
         EventActivityIdControl(EVENT_ACTIVITY_CTRL_GET_ID, &capturedRelatedId);
@@ -752,7 +752,7 @@ public:
 // This is the ultimate base class implementation for all activities.  Activity classes are defined with
 // DEFINE_TRACELOGGING_ACTIVITY, DEFINE_CALLCONTEXT_ACTIVITY, DEFINE_TELEMETRY_ACTIVITY and others
 
-template <typename ActivityTraceLoggingType, ActivityOptions options = ActivityOptions::None, UINT64 keyword = 0, UINT8 level = WINEVENT_LEVEL_VERBOSE, UINT64 privacyTag = 0, typename TlgReflectorTag = _TlgReflectorTag_Param0IsProviderType>
+template <typename ActivityTraceLoggingType, ActivityOptions options = ActivityOptions::None, UINT64 keyword = 0, UINT8 level = WINEVENT_LEVEL_VERBOSE, UINT64 privacyTag = 0, typename TlgReflectorTag = _TlgReflectorTag_Param0IsProviderType, typename SharedAllocator = details::default_shared_object_allocator>
 class ActivityBase : public details::IFailureCallback
 {
 public:
@@ -1060,6 +1060,24 @@ protected:
         m_pActivityData->IncrementExpectedStopCount();
     }
 
+    bool TryShareActivityData() WI_NOEXCEPT
+    {
+        if (!m_sharedActivityData)
+        {
+            // The first split must share the activity before it increments the expected stop count.
+            // If allocation fails, the original activity and its stop count remain unchanged.
+            if (!m_sharedActivityData.create(wistd::move(m_activityData)))
+            {
+                return false;
+            }
+
+            m_pActivityData = m_sharedActivityData.get();
+            m_callbackHolder.SetCallContext(m_pActivityData->GetCallContext());
+        }
+
+        return true;
+    }
+
     // Locking should not be required on these accessors as we only use this at reporting (which will only happen from
     // the final stop)
 
@@ -1288,7 +1306,7 @@ private:
 
     mutable ActivityData<ActivityTraceLoggingType, TlgReflectorTag> m_activityData;
     mutable ActivityData<ActivityTraceLoggingType, TlgReflectorTag>* m_pActivityData;
-    mutable details::shared_object<ActivityData<ActivityTraceLoggingType, TlgReflectorTag>> m_sharedActivityData;
+    mutable details::shared_object<ActivityData<ActivityTraceLoggingType, TlgReflectorTag>, SharedAllocator> m_sharedActivityData;
     mutable details::ThreadFailureCallbackHolder m_callbackHolder;
 };
 
@@ -1468,6 +1486,19 @@ private:
             __FAIL_FAST_IMMEDIATE_ASSERT__(IsRunning()); \
             IncrementExpectedStopCount(); \
             return ActivityClassName(*this); \
+        } \
+        /* split must be distinct and nonrunning. Allocation failure leaves both activities unchanged. */ \
+        WI_NODISCARD bool TrySplit(_Inout_ ActivityClassName* split) WI_NOEXCEPT \
+        { \
+            __FAIL_FAST_IMMEDIATE_ASSERT__(IsRunning()); \
+            __FAIL_FAST_IMMEDIATE_ASSERT__((split != nullptr) && (split != this) && !split->IsRunning()); \
+            if (!TryShareActivityData()) \
+            { \
+                return false; \
+            } \
+            IncrementExpectedStopCount(); \
+            *split = *this; \
+            return true; \
         } \
         WI_NODISCARD ActivityClassName TransferToCurrentThread() WI_NOEXCEPT \
         { \

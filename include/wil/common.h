@@ -84,6 +84,16 @@
 /// @endcond
 
 /// @cond
+// Marks the failure branch of a check. Failures are rare, so the success path
+// stays on the fall-through. The attribute needs C++20.
+#if (defined(_MSVC_LANG) && (_MSVC_LANG >= 202002L)) || (__cplusplus >= 202002L)
+#define __WI_UNLIKELY [[unlikely]]
+#else
+#define __WI_UNLIKELY
+#endif
+/// @endcond
+
+/// @cond
 #if defined(__MINGW32__) && !defined(_NATIVE_WCHAR_T_DEFINED)
 using __wchar_t = wchar_t;
 #endif

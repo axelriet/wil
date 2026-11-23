@@ -609,6 +609,30 @@ TEST_CASE("ResultTests::ErrorMacros", "[result]")
     REQUIRE_NOERROR(__FAIL_FAST_ASSERT_WIN32_BOOL_FALSE__(TRUE));
 }
 
+// With RESULT_LAZY_MESSAGE_ARGUMENTS at its default (0), the conditional LOG_XXX_MSG, FAIL_FAST_XXX_MSG and
+// THROW_XXX_MSG macros evaluate their message arguments on every use, success included, as they always did
+// (LazyMessageArgumentsTests.cpp tests the setting at 1)
+TEST_CASE("ResultTests::MessageArgumentsEvaluatedByDefault", "[result]")
+{
+    static_assert(RESULT_LAZY_MESSAGE_ARGUMENTS == 0, "The default");
+
+    int evaluations = 0;
+    auto counted = [&](int value) {
+        ++evaluations;
+        return value;
+    };
+
+    REQUIRE(LOG_IF_FAILED_MSG(S_OK, "%d", counted(1)) == S_OK);
+    REQUIRE(LOG_HR_IF_MSG(E_FAIL, false, "%d", counted(1)) == false);
+    REQUIRE_NOERROR(FAIL_FAST_IF_MSG(false, "%d", counted(1)));
+    REQUIRE(evaluations == 3);
+
+#ifdef WIL_ENABLE_EXCEPTIONS
+    REQUIRE(THROW_IF_FAILED_MSG(S_OK, "%d", counted(1)) == S_OK);
+    REQUIRE(evaluations == 4);
+#endif
+}
+
 // The originate helper isn't compatible with CX so don't test it in that mode.
 #if !defined(__cplusplus_winrt) && (NTDDI_VERSION >= NTDDI_WIN8)
 TEST_CASE("ResultTests::NoOriginationByDefault", "[result]")
@@ -772,4 +796,55 @@ TEST_CASE("ResultTests::ReportDoesNotChangeLastError", "[result]")
     ::SetLastError(ERROR_ABIOS_ERROR);
     LOG_IF_WIN32_BOOL_FALSE(FALSE);
     REQUIRE(::GetLastError() == ERROR_ABIOS_ERROR);
+}
+
+static void __stdcall FailureLogCustomMessage(wil::FailureInfo*, PWSTR text, size_t count) noexcept
+{
+    if (FAILED(StringCchCopyW(text, count, L"custom callback text")))
+    {
+        text[0] = L'\0';
+    }
+}
+
+TEST_CASE("ResultTests::FailureLogFilePrefix", "[result]")
+{
+    decltype(wil::g_pfnResultLoggingCallback) callback = nullptr;
+    auto restoreCallback = witest::AssignTemporaryValue(&wil::g_pfnResultLoggingCallback, callback);
+    auto restoreEnabled = witest::AssignTemporaryValue(&wil::details::g_resultMessageCallbackSet, false);
+    wil::FailureInfo failure{};
+    failure.type = wil::FailureType::Return;
+    failure.hr = E_ACCESSDENIED;
+    failure.pszFile = "formatter.cpp";
+    failure.uLineNumber = 42;
+    failure.pszModule = "formatter_module";
+    failure.returnAddress = &failure;
+    failure.cFailureCount = 7;
+    wchar_t message[1024]{};
+    wchar_t expected[256]{};
+    REQUIRE_SUCCEEDED(StringCchPrintfW(expected, ARRAYSIZE(expected),
+                                      L"formatter.cpp(42): [formatter_module!%p] ReturnHr(7) tid(", failure.returnAddress));
+    REQUIRE(wil::GetFailureLogString(message, ARRAYSIZE(message), failure) == S_OK);
+    REQUIRE(lstrlenW(message) >= lstrlenW(expected));
+    REQUIRE(CompareStringOrdinal(message, lstrlenW(expected), expected, -1, FALSE) == CSTR_EQUAL);
+}
+
+TEST_CASE("ResultTests::FailureLogCustomMessage", "[result]")
+{
+    decltype(wil::g_pfnResultLoggingCallback) callback = nullptr;
+    auto restoreCallback = witest::AssignTemporaryValue(&wil::g_pfnResultLoggingCallback, callback);
+    auto restoreEnabled = witest::AssignTemporaryValue(&wil::details::g_resultMessageCallbackSet, false);
+    wil::FailureInfo failure{};
+    failure.type = wil::FailureType::Return;
+    failure.hr = E_ACCESSDENIED;
+    failure.pszFile = "formatter.cpp";
+    failure.uLineNumber = 42;
+    failure.pszModule = "formatter_module";
+    failure.returnAddress = &failure;
+    wchar_t message[1024]{};
+    wil::SetResultMessageCallback(FailureLogCustomMessage);
+    REQUIRE(wil::GetFailureLogString(message, ARRAYSIZE(message), failure) == S_OK);
+    REQUIRE(CompareStringOrdinal(message, -1, L"custom callback text", -1, FALSE) == CSTR_EQUAL);
+    REQUIRE(failure.hr == E_ACCESSDENIED);
+    REQUIRE(failure.uLineNumber == 42);
+    REQUIRE(failure.returnAddress == &failure);
 }

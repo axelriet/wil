@@ -62,6 +62,8 @@ set(COMMON_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/CommonTests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ComTests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/FileSystemTests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/LazyMessageArgumentsStdcallTests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/LazyMessageArgumentsTests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/MockingTests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/NTResultTests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ResourceTests.cpp
@@ -173,6 +175,24 @@ endif()
 if (${WIL_ENABLE_ASAN})
     add_subdirectory(sanitize-address)
     add_test(NAME witest.asan COMMAND $<TARGET_FILE:witest.asan>)
+endif()
+
+# LazyMessageArgumentsStdcallTests.cpp is built without the precompiled header, and on x86 with another default calling
+# convention than the other sources (/Gz), so that units built with different defaults report failures through the same
+# macros in one binary
+set(WIL_TEST_DIRECTORIES app cpplatest noexcept normal win7)
+if (${WIL_ENABLE_ASAN})
+    list(APPEND WIL_TEST_DIRECTORIES sanitize-address)
+endif()
+
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/LazyMessageArgumentsStdcallTests.cpp
+    DIRECTORY ${WIL_TEST_DIRECTORIES}
+    PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+
+if (MSVC AND (CMAKE_SIZEOF_VOID_P EQUAL 4))
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/LazyMessageArgumentsStdcallTests.cpp
+        DIRECTORY ${WIL_TEST_DIRECTORIES}
+        PROPERTIES COMPILE_OPTIONS /Gz)
 endif()
 
 if (${WIL_ENABLE_UBSAN})

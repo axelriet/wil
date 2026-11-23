@@ -185,7 +185,62 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 //      0   - Branching will not happen inline to the macros
 //      1   - Branching is pushed into the calling function via __forceinline
 // The default value is '1'.  Note that XXX_MSG functions are always effectively mode '0' due to the
-// compiler's unwillingness to inline var-arg functions.
+// compiler's unwillingness to inline var-arg functions, unless RESULT_LAZY_MESSAGE_ARGUMENTS is '1'.
+
+// RESULT_LAZY_MESSAGE_ARGUMENTS
+// For conditional macros that take a message (other than RETURN_XXX_MSG), this controls when the format
+// string and its arguments are evaluated.  The values are:
+//      0   - On every use of the macro, before the check, as ordinary function arguments
+//      1   - Only when the check fails, after it, as the RETURN_XXX_MSG macros do: an argument that is valid
+//            only in the failure state is never evaluated on success, and a check that passes does not
+//            evaluate its message
+// The default value is '0', with which the macros expand exactly as they always did.  With '1', the macro passes
+// its message in a lambda that captures by reference, which the function called by the macro calls only on
+// failure.  In that mode:
+//      * C++14 is required.  An older standard fails to compile rather than evaluate every argument, since a
+//        translation unit that sets '1' may rely on it (an argument valid only on failure would crash).
+//      * The check is inlined or not as RESULT_INLINE_ERROR_TESTS says, as for the macros without a message.
+//        With RESULT_INLINE_ERROR_TESTS '1', the reported return address is in the function that uses the
+//        macro once the compiler inlines (in builds that do not, such as /Od, it is in WIL's code, as for the
+//        macros without a message); with '0', it always is, and each use of a macro calls a function of its own.
+//      * The macros that report the last error (XXX_IF_WIN32_BOOL_FALSE_MSG, XXX_LAST_ERROR_IF_MSG and
+//        XXX_LAST_ERROR_IF_NULL_MSG) read it right after the check, before the arguments run, and restore it
+//        after them, so that they report the error of the checked call whatever the arguments do to it.  (With
+//        '0', an argument that changes the last error changes the error reported if the compiler evaluates it
+//        after the checked call: the order in which a call's arguments are evaluated is unspecified.)
+//      * The LOG_ and FAIL_FAST_ functions stay noexcept, and now evaluate the arguments: an argument that
+//        throws on failure ends the process (std::terminate) instead of propagating, and C++ Core Check no
+//        longer reports it (C26447) in a noexcept caller.  THROW_ propagates it.
+//      * Cost, measured over eight common forms of these macros, 240 and 1000 uses each in a function of its own
+//        (MSVC x64 and ARM64, clang-cl x64, /O2): with RESULT_INLINE_ERROR_TESTS '1', a check that passes runs
+//        its test and nothing else, and each use takes 2% to 7% more code than with this setting at '0'.  With
+//        RESULT_INLINE_ERROR_TESTS '0', a check that passes also stores the addresses of the variables its
+//        message names and calls a function of its own, and each use takes 2% to 5% more code with MSVC and
+//        twice as much with clang, whose /GS then guards most functions that use one.  Either way, each use
+//        instantiates its own lambda and conditional method: 1 to 2 ms more to compile (1.5 to 2.1 times as
+//        long as with this setting at '0'), and with /Zi 4 to 5 KB more of object file with MSVC (1 to 2 KB
+//        with clang).
+// The arguments become code of the lambda, with the limits of a lambda:
+//      * __func__, __FUNCTION__, __FUNCSIG__, __PRETTY_FUNCTION__ and std::source_location::current() in an
+//        argument (or __FUNCTION__ spliced into the format string) describe the lambda, not the calling
+//        function, and _ReturnAddress() may too.  Read them into a local before the macro, or rely on
+//        FailureInfo::pszFunction (RESULT_DIAGNOSTICS_LEVEL 4 and up), which is taken outside the lambda.
+//        clang-tidy's bugprone-lambda-function-name finds such arguments.
+//      * A structured binding named in an argument is captured, which C++ allows from C++20; before it, MSVC and
+//        clang 16 and later accept it (clang as an extension: the macros silence its -Wc++20-extensions warning
+//        in their message, and with it any other C++20 extension used there) and older clang rejects it.  A
+//        binding to a bit-field cannot be captured at all.  co_await cannot appear in an argument.  Use a local
+//        instead.
+//      * A lambda that captures by reference is allowed only in a function body or a default member
+//        initializer: at namespace scope, in the initializer of a static data member or in a default argument,
+//        clang rejects the macros, and MSVC warns (C5253, level 4) under /permissive-, which C++20 implies.
+//        Wrap such a use in a lambda called on the spot, or move it into a function.
+//      * Before C++20, a lambda cannot appear in an unevaluated operand: the macros do not compile inside
+//        decltype, sizeof, noexcept() or typeid, nor, with clang when RESULT_DEBUG is not defined, inside
+//        WI_ASSERT, WI_VERIFY and the like (which check their expression with sizeof there).  Use a local.
+// The value may differ between translation units, as those of the settings above may.  An inline function that
+// uses these macros then gets a definition per value, and the linker keeps one of them: a function that relies
+// on the lazy evaluation (an argument valid only on failure) must see '1' in every translation unit.
 
 // RESULT_DIAGNOSTICS_LEVEL_FAIL_FAST
 // RESULT_INCLUDE_CALLER_RETURNADDRESS_FAIL_FAST
@@ -219,6 +274,15 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #endif
 #ifndef RESULT_INLINE_ERROR_TESTS_FAIL_FAST
 #define RESULT_INLINE_ERROR_TESTS_FAIL_FAST RESULT_INLINE_ERROR_TESTS
+#endif
+#ifndef RESULT_LAZY_MESSAGE_ARGUMENTS
+#define RESULT_LAZY_MESSAGE_ARGUMENTS 0
+#endif
+#if (RESULT_LAZY_MESSAGE_ARGUMENTS != 0) && (RESULT_LAZY_MESSAGE_ARGUMENTS != 1)
+#error Invalid value for 'RESULT_LAZY_MESSAGE_ARGUMENTS'; valid values are 0 and 1
+#endif
+#if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1) && (__WI_LIBCPP_STD_VER < 14)
+#error RESULT_LAZY_MESSAGE_ARGUMENTS 1 requires C++14 or later, since it passes the message in a generic lambda
 #endif
 /// @endcond
 
@@ -465,11 +529,15 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __R_CONDITIONAL_TEMPLATE_METHOD __R_CONDITIONAL_NOINLINE_TEMPLATE_METHOD
 #define __R_CONDITIONAL_FN_CALL __R_CONDITIONAL_NOINLINE_FN_CALL
 #define __R_CONDITIONAL_FN_CALL_ONLY __R_CONDITIONAL_NOINLINE_FN_CALL_ONLY
+#define __R_CONDITIONAL_LAZY_LOCALS void* const returnAddress = _ReturnAddress()
+#define __R_CONDITIONAL_LAZY_FN_CALL __R_FN_CALL returnAddress __R_COMMA
 #else
 #define __R_CONDITIONAL_METHOD __R_CONDITIONAL_INLINE_METHOD
 #define __R_CONDITIONAL_TEMPLATE_METHOD __R_CONDITIONAL_INLINE_TEMPLATE_METHOD
 #define __R_CONDITIONAL_FN_CALL __R_CONDITIONAL_INLINE_FN_CALL
 #define __R_CONDITIONAL_FN_CALL_ONLY __R_CONDITIONAL_INLINE_FN_CALL_ONLY
+#define __R_CONDITIONAL_LAZY_LOCALS
+#define __R_CONDITIONAL_LAZY_FN_CALL __R_FN_CALL
 #endif
 #define __R_CONDITIONAL_FN_PARAMS __R_FN_PARAMS
 #define __R_CONDITIONAL_FN_PARAMS_ONLY __R_FN_PARAMS_ONLY
@@ -661,11 +729,15 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __RFF_CONDITIONAL_TEMPLATE_METHOD __RFF_CONDITIONAL_NOINLINE_TEMPLATE_METHOD
 #define __RFF_CONDITIONAL_FN_CALL __RFF_CONDITIONAL_NOINLINE_FN_CALL
 #define __RFF_CONDITIONAL_FN_CALL_ONLY __RFF_CONDITIONAL_NOINLINE_FN_CALL_ONLY
+#define __RFF_CONDITIONAL_LAZY_LOCALS void* const returnAddress = _ReturnAddress()
+#define __RFF_CONDITIONAL_LAZY_FN_CALL __RFF_FN_CALL returnAddress __RFF_COMMA
 #else
 #define __RFF_CONDITIONAL_METHOD __RFF_CONDITIONAL_INLINE_METHOD
 #define __RFF_CONDITIONAL_TEMPLATE_METHOD __RFF_CONDITIONAL_INLINE_TEMPLATE_METHOD
 #define __RFF_CONDITIONAL_FN_CALL __RFF_CONDITIONAL_INLINE_FN_CALL
 #define __RFF_CONDITIONAL_FN_CALL_ONLY __RFF_CONDITIONAL_INLINE_FN_CALL_ONLY
+#define __RFF_CONDITIONAL_LAZY_LOCALS
+#define __RFF_CONDITIONAL_LAZY_FN_CALL __RFF_FN_CALL
 #endif
 #define __RFF_CONDITIONAL_FN_PARAMS __RFF_FN_PARAMS
 #define __RFF_CONDITIONAL_FN_PARAMS_ONLY __RFF_FN_PARAMS_ONLY
@@ -691,12 +763,38 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __WI_CHECK_MSG_FMT(fmt, ...) fmt, ##__VA_ARGS__
 #endif
 
+// The message of a conditional LOG_XXX_MSG, FAIL_FAST_XXX_MSG or THROW_XXX_MSG macro (see RESULT_LAZY_MESSAGE_ARGUMENTS
+// above): the format string and its arguments when the setting is 0, as for the other _MSG macros; when it is 1, a
+// lambda that the conditional method calls only when the check fails, with the reporter to which it passes them. Under
+// clang before C++20, the capture of a structured binding named in a message argument is an extension, whose warning
+// (-Wc++20-extensions, on by default) is silenced inside the message.
+#if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
+#if defined(__clang__) && defined(__has_warning)
+#if __has_warning("-Wc++20-extensions")
+#define __WI_MSG_ARGS_WARNINGS_S __WI_PUSH_WARNINGS __WI_CLANG_DISABLE_WARNING(-Wc++20-extensions)
+#define __WI_MSG_ARGS_WARNINGS_E __WI_POP_WARNINGS
+#endif
+#endif
+#ifndef __WI_MSG_ARGS_WARNINGS_S
+#define __WI_MSG_ARGS_WARNINGS_S
+#define __WI_MSG_ARGS_WARNINGS_E
+#endif
+// clang-format off
+#define __WI_MSG_ARGS(fmt, ...) \
+    __WI_MSG_ARGS_WARNINGS_S [&](const auto& __wilReport) { \
+        __wilReport(__WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)); \
+    } __WI_MSG_ARGS_WARNINGS_E
+// clang-format on
+#else
+#define __WI_MSG_ARGS(fmt, ...) __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)
+#endif
+
 // Helpers for return macros
 #define __RETURN_HR_MSG(hr, str, fmt, ...) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const HRESULT __hr = (hr); \
-        if (FAILED(__hr)) \
+        if (FAILED(__hr)) __WI_UNLIKELY \
         { \
             __R_FN(Return_HrMsg)(__R_INFO(str) __hr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)); \
         } \
@@ -715,7 +813,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const DWORD __err = (err); \
-        if (FAILED_WIN32(__err)) \
+        if (FAILED_WIN32(__err)) __WI_UNLIKELY \
         { \
             return __R_FN(Return_Win32Msg)(__R_INFO(str) __err, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)); \
         } \
@@ -735,7 +833,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const NTSTATUS __status = (status); \
-        if (FAILED_NTSTATUS(__status)) \
+        if (FAILED_NTSTATUS(__status)) __WI_UNLIKELY \
         { \
             return __R_FN(Return_NtStatusMsg)(__R_INFO(str) __status, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__)); \
         } \
@@ -753,7 +851,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const HRESULT __hr = (hr); \
-        if (FAILED(__hr)) \
+        if (FAILED(__hr)) __WI_UNLIKELY \
         { \
             __R_FN(Return_Hr)(__R_INFO(str) __hr); \
         } \
@@ -764,7 +862,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const HRESULT __hr = (hr); \
-        if (FAILED(__hr)) \
+        if (FAILED(__hr)) __WI_UNLIKELY \
         { \
             __R_FN(Return_Hr)(__R_INFO_NOFILE(str) __hr); \
         } \
@@ -799,7 +897,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const DWORD __err = (err); \
-        if (FAILED_WIN32(__err)) \
+        if (FAILED_WIN32(__err)) __WI_UNLIKELY \
         { \
             return __R_FN(Return_Win32)(__R_INFO(str) __err); \
         } \
@@ -819,7 +917,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const NTSTATUS __status = (status); \
-        if (FAILED_NTSTATUS(__status)) \
+        if (FAILED_NTSTATUS(__status)) __WI_UNLIKELY \
         { \
             return __R_FN(Return_NtStatus)(__R_INFO(str) __status); \
         } \
@@ -851,7 +949,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const auto __hrRet = wil::verify_hresult(hr); \
-        if (FAILED(__hrRet)) \
+        if (FAILED(__hrRet)) __WI_UNLIKELY \
         { \
             __RETURN_HR_FAIL(__hrRet, #hr); \
         } \
@@ -861,7 +959,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const auto __boolRet = wil::verify_BOOL(win32BOOL); \
-        if (!__boolRet) \
+        if (!__boolRet) __WI_UNLIKELY \
         { \
             __RETURN_GLE_FAIL(#win32BOOL); \
         } \
@@ -871,7 +969,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const DWORD __errRet = (win32err); \
-        if (FAILED_WIN32(__errRet)) \
+        if (FAILED_WIN32(__errRet)) __WI_UNLIKELY \
         { \
             __RETURN_WIN32_FAIL(__errRet, #win32err); \
         } \
@@ -880,7 +978,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_IF_NULL_ALLOC(ptr) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_HR_FAIL(E_OUTOFMEMORY, #ptr); \
         } \
@@ -889,7 +987,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_HR_IF(hr, condition) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (wil::verify_bool(condition)) \
+        if (wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             __RETURN_HR(wil::verify_hresult(hr), #condition); \
         } \
@@ -898,7 +996,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_HR_IF_NULL(hr, ptr) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_HR(wil::verify_hresult(hr), #ptr); \
         } \
@@ -907,7 +1005,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_LAST_ERROR_IF(condition) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (wil::verify_bool(condition)) \
+        if (wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             __RETURN_GLE_FAIL(#condition); \
         } \
@@ -916,7 +1014,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_LAST_ERROR_IF_NULL(ptr) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_GLE_FAIL(#ptr); \
         } \
@@ -926,7 +1024,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const NTSTATUS __statusRet = (status); \
-        if (FAILED_NTSTATUS(__statusRet)) \
+        if (FAILED_NTSTATUS(__statusRet)) __WI_UNLIKELY \
         { \
             __RETURN_NTSTATUS_FAIL(__statusRet, #status); \
         } \
@@ -944,7 +1042,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const auto __hrRet = wil::verify_hresult(hr); \
-        if (FAILED(__hrRet)) \
+        if (FAILED(__hrRet)) __WI_UNLIKELY \
         { \
             __RETURN_HR_MSG_FAIL(__hrRet, #hr, fmt, ##__VA_ARGS__); \
         } \
@@ -953,7 +1051,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_IF_WIN32_BOOL_FALSE_MSG(win32BOOL, fmt, ...) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (!wil::verify_BOOL(win32BOOL)) \
+        if (!wil::verify_BOOL(win32BOOL)) __WI_UNLIKELY \
         { \
             __RETURN_GLE_MSG_FAIL(#win32BOOL, fmt, ##__VA_ARGS__); \
         } \
@@ -963,7 +1061,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const DWORD __errRet = (win32err); \
-        if (FAILED_WIN32(__errRet)) \
+        if (FAILED_WIN32(__errRet)) __WI_UNLIKELY \
         { \
             __RETURN_WIN32_MSG_FAIL(__errRet, #win32err, fmt, ##__VA_ARGS__); \
         } \
@@ -972,7 +1070,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_IF_NULL_ALLOC_MSG(ptr, fmt, ...) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_HR_MSG_FAIL(E_OUTOFMEMORY, #ptr, fmt, ##__VA_ARGS__); \
         } \
@@ -981,7 +1079,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_HR_IF_MSG(hr, condition, fmt, ...) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (wil::verify_bool(condition)) \
+        if (wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             __RETURN_HR_MSG(wil::verify_hresult(hr), #condition, fmt, ##__VA_ARGS__); \
         } \
@@ -990,7 +1088,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_HR_IF_NULL_MSG(hr, ptr, fmt, ...) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_HR_MSG(wil::verify_hresult(hr), #ptr, fmt, ##__VA_ARGS__); \
         } \
@@ -999,7 +1097,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_LAST_ERROR_IF_MSG(condition, fmt, ...) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (wil::verify_bool(condition)) \
+        if (wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             __RETURN_GLE_MSG_FAIL(#condition, fmt, ##__VA_ARGS__); \
         } \
@@ -1008,7 +1106,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_LAST_ERROR_IF_NULL_MSG(ptr, fmt, ...) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_GLE_MSG_FAIL(#ptr, fmt, ##__VA_ARGS__); \
         } \
@@ -1018,7 +1116,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const NTSTATUS __statusRet = (status); \
-        if (FAILED_NTSTATUS(__statusRet)) \
+        if (FAILED_NTSTATUS(__statusRet)) __WI_UNLIKELY \
         { \
             __RETURN_NTSTATUS_MSG_FAIL(__statusRet, #status, fmt, ##__VA_ARGS__); \
         } \
@@ -1030,7 +1128,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const auto __hrRet = wil::verify_hresult(hr); \
-        if (FAILED(__hrRet)) \
+        if (FAILED(__hrRet)) __WI_UNLIKELY \
         { \
             return __hrRet; \
         } \
@@ -1039,7 +1137,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_IF_WIN32_BOOL_FALSE_EXPECTED(win32BOOL) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (!wil::verify_BOOL(win32BOOL)) \
+        if (!wil::verify_BOOL(win32BOOL)) __WI_UNLIKELY \
         { \
             return wil::details::GetLastErrorFailHr(); \
         } \
@@ -1049,7 +1147,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const DWORD __errRet = (win32err); \
-        if (FAILED_WIN32(__errRet)) \
+        if (FAILED_WIN32(__errRet)) __WI_UNLIKELY \
         { \
             return __HRESULT_FROM_WIN32(__errRet); \
         } \
@@ -1058,7 +1156,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_IF_NULL_ALLOC_EXPECTED(ptr) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             return E_OUTOFMEMORY; \
         } \
@@ -1067,7 +1165,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_HR_IF_EXPECTED(hr, condition) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (wil::verify_bool(condition)) \
+        if (wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             return wil::verify_hresult(hr); \
         } \
@@ -1076,7 +1174,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_HR_IF_NULL_EXPECTED(hr, ptr) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             return wil::verify_hresult(hr); \
         } \
@@ -1085,7 +1183,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_LAST_ERROR_IF_EXPECTED(condition) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if (wil::verify_bool(condition)) \
+        if (wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             return wil::details::GetLastErrorFailHr(); \
         } \
@@ -1094,7 +1192,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define RETURN_LAST_ERROR_IF_NULL_EXPECTED(ptr) \
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             return wil::details::GetLastErrorFailHr(); \
         } \
@@ -1104,7 +1202,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     __WI_SUPPRESS_BREAKING_WARNINGS_S do \
     { \
         const NTSTATUS __statusRet = (status); \
-        if (FAILED_NTSTATUS(__statusRet)) \
+        if (FAILED_NTSTATUS(__statusRet)) __WI_UNLIKELY \
         { \
             return wil::details::NtStatusToHr(__statusRet); \
         } \
@@ -1118,7 +1216,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     do \
     { \
         const auto __hrRet = wil::verify_hresult(hr); \
-        if (FAILED(__hrRet)) \
+        if (FAILED(__hrRet)) __WI_UNLIKELY \
         { \
             if ((__hrRet == wil::verify_hresult(hrExpected)) WI_FOREACH(__WI_OR_IS_EXPECTED_HRESULT, ##__VA_ARGS__)) \
             { \
@@ -1133,7 +1231,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     do \
     { \
         const auto __hrRet = wil::verify_hresult(hr); \
-        if (FAILED(__hrRet)) \
+        if (FAILED(__hrRet)) __WI_UNLIKELY \
         { \
             if ((__hrRet == wil::verify_hresult(hrExpected)) WI_FOREACH(__WI_OR_IS_EXPECTED_HRESULT, ##__VA_ARGS__)) \
             { \
@@ -1185,24 +1283,23 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally logs failures - returns parameter value - logs a var-arg message on failure
 #define LOG_IF_FAILED_MSG(hr, fmt, ...) \
-    __R_FN(Log_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define LOG_IF_WIN32_BOOL_FALSE_MSG(win32BOOL, fmt, ...) \
-    __R_FN(Log_IfWin32BoolFalseMsg)(__R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfWin32BoolFalseMsg)(__R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define LOG_IF_WIN32_ERROR_MSG(win32err, fmt, ...) \
-    __R_FN(Log_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
-#define LOG_IF_NULL_ALLOC_MSG(ptr, fmt, ...) \
-    __R_FN(Log_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+#define LOG_IF_NULL_ALLOC_MSG(ptr, fmt, ...) __R_FN(Log_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define LOG_HR_IF_MSG(hr, condition, fmt, ...) \
     __R_FN(Log_HrIfMsg) \
-    (__R_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    (__R_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define LOG_HR_IF_NULL_MSG(hr, ptr, fmt, ...) \
-    __R_FN(Log_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Log_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define LOG_LAST_ERROR_IF_MSG(condition, fmt, ...) \
-    __R_FN(Log_GetLastErrorIfMsg)(__R_INFO(#condition) wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Log_GetLastErrorIfMsg)(__R_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define LOG_LAST_ERROR_IF_NULL_MSG(ptr, fmt, ...) \
-    __R_FN(Log_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Log_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define LOG_IF_NTSTATUS_FAILED_MSG(status, fmt, ...) \
-    __R_FN(Log_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Log_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 
 /// @cond
 #define __WI_COMMA_EXPECTED_HRESULT(e) , wil::verify_hresult(e)
@@ -1248,26 +1345,26 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally fail fast failures - returns parameter value - fail fast a var-arg message on failure
 #define FAIL_FAST_IF_FAILED_MSG(hr, fmt, ...) \
-    __RFF_FN(FailFast_IfFailedMsg)(__RFF_INFO(#hr) wil::verify_hresult(hr), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfFailedMsg)(__RFF_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_WIN32_BOOL_FALSE_MSG(win32BOOL, fmt, ...) \
     __RFF_FN(FailFast_IfWin32BoolFalseMsg) \
-    (__RFF_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    (__RFF_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_WIN32_ERROR_MSG(win32err, fmt, ...) \
-    __RFF_FN(FailFast_IfWin32ErrorMsg)(__RFF_INFO(#win32err) win32err, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfWin32ErrorMsg)(__RFF_INFO(#win32err) win32err, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_NULL_ALLOC_MSG(ptr, fmt, ...) \
-    __RFF_FN(FailFast_IfNullAllocMsg)(__RFF_INFO(#ptr) ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfNullAllocMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_HR_IF_MSG(hr, condition, fmt, ...) \
     __RFF_FN(FailFast_HrIfMsg) \
-    (__RFF_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    (__RFF_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_HR_IF_NULL_MSG(hr, ptr, fmt, ...) \
-    __RFF_FN(FailFast_HrIfNullMsg)(__RFF_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_HrIfNullMsg)(__RFF_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_LAST_ERROR_IF_MSG(condition, fmt, ...) \
     __RFF_FN(FailFast_GetLastErrorIfMsg) \
-    (__RFF_INFO(#condition) wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    (__RFF_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_LAST_ERROR_IF_NULL_MSG(ptr, fmt, ...) \
-    __RFF_FN(FailFast_GetLastErrorIfNullMsg)(__RFF_INFO(#ptr) ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_GetLastErrorIfNullMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define FAIL_FAST_IF_NTSTATUS_FAILED_MSG(status, fmt, ...) \
-    __RFF_FN(FailFast_IfNtStatusFailedMsg)(__RFF_INFO(#status) status, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfNtStatusFailedMsg)(__RFF_INFO(#status) status, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 
 // Always fail fast a known failure
 #ifndef FAIL_FAST
@@ -1283,9 +1380,8 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally fail fast failures - returns parameter value - fail fast a var-arg message on failure
 #define FAIL_FAST_IF_MSG(condition, fmt, ...) \
-    __RFF_FN(FailFast_IfMsg)(__RFF_INFO(#condition) wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
-#define FAIL_FAST_IF_NULL_MSG(ptr, fmt, ...) \
-    __RFF_FN(FailFast_IfNullMsg)(__RFF_INFO(#ptr) ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __RFF_FN(FailFast_IfMsg)(__RFF_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+#define FAIL_FAST_IF_NULL_MSG(ptr, fmt, ...) __RFF_FN(FailFast_IfNullMsg)(__RFF_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 
 // Immediate fail fast (no telemetry - use rarely / only when *already* in an undefined state)
 #define FAIL_FAST_IMMEDIATE() __RFF_FN(FailFastImmediate_Unexpected)()
@@ -1310,7 +1406,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define WI_FAIL_FAST_ASSERT(condition) \
     do \
     { \
-        if (!wil::verify_bool(condition)) \
+        if (!wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             WI_ASSERT_FAIL(#condition); \
             __RFF_FN(FailFast_Unexpected)(__RFF_INFO_ONLY(#condition)); \
@@ -1319,7 +1415,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define WI_FAIL_FAST_ASSERT_MSG(condition, msg) \
     do \
     { \
-        if (!wil::verify_bool(condition)) \
+        if (!wil::verify_bool(condition)) __WI_UNLIKELY \
         { \
             WI_ASSERT_FAIL(msg); \
             __RFF_FN(FailFast_UnexpectedMsg)(__RFF_INFO(#condition) __WI_CHECK_MSG_FMT(msg)); \
@@ -1365,27 +1461,26 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 
 // Conditionally throw failures - returns parameter value - throw a var-arg message on failure
 #define THROW_IF_FAILED_MSG(hr, fmt, ...) \
-    __R_FN(Throw_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfFailedMsg)(__R_INFO(#hr) wil::verify_hresult(hr), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_IF_WIN32_BOOL_FALSE_MSG(win32BOOL, fmt, ...) \
-    __R_FN(Throw_IfWin32BoolFalseMsg)(__R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfWin32BoolFalseMsg)(__R_INFO(#win32BOOL) wil::verify_BOOL(win32BOOL), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_IF_WIN32_ERROR_MSG(win32err, fmt, ...) \
-    __R_FN(Throw_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
-#define THROW_IF_NULL_ALLOC_MSG(ptr, fmt, ...) \
-    __R_FN(Throw_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfWin32ErrorMsg)(__R_INFO(#win32err) win32err, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
+#define THROW_IF_NULL_ALLOC_MSG(ptr, fmt, ...) __R_FN(Throw_IfNullAllocMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_HR_IF_MSG(hr, condition, fmt, ...) \
     __R_FN(Throw_HrIfMsg) \
-    (__R_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    (__R_INFO(#condition) wil::verify_hresult(hr), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_HR_IF_NULL_MSG(hr, ptr, fmt, ...) \
-    __R_FN(Throw_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_HrIfNullMsg)(__R_INFO(#ptr) wil::verify_hresult(hr), ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_WIN32_IF_MSG(win32err, condition, fmt, ...) \
     __R_FN(Throw_Win32IfMsg) \
-    (__R_INFO(#condition) wil::verify_win32(win32err), wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    (__R_INFO(#condition) wil::verify_win32(win32err), wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_LAST_ERROR_IF_MSG(condition, fmt, ...) \
-    __R_FN(Throw_GetLastErrorIfMsg)(__R_INFO(#condition) wil::verify_bool(condition), __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_GetLastErrorIfMsg)(__R_INFO(#condition) wil::verify_bool(condition), __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_LAST_ERROR_IF_NULL_MSG(ptr, fmt, ...) \
-    __R_FN(Throw_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_GetLastErrorIfNullMsg)(__R_INFO(#ptr) ptr, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 #define THROW_IF_NTSTATUS_FAILED_MSG(status, fmt, ...) \
-    __R_FN(Throw_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_CHECK_MSG_FMT(fmt, ##__VA_ARGS__))
+    __R_FN(Throw_IfNtStatusFailedMsg)(__R_INFO(#status) status, __WI_MSG_ARGS(fmt, ##__VA_ARGS__))
 
 //*****************************************************************************
 // Macros to catch and convert exceptions on failure
@@ -1519,7 +1614,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     do \
     { \
         const auto __passed = wil::verify_bool(condition); \
-        if (!__passed) \
+        if (!__passed) __WI_UNLIKELY \
         { \
             WI_USAGE_ERROR(msg, ##__VA_ARGS__); \
         } \
@@ -1528,7 +1623,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     do \
     { \
         const auto __passed = wil::verify_bool(condition); \
-        if (!__passed) \
+        if (!__passed) __WI_UNLIKELY \
         { \
             WI_USAGE_ERROR_FORWARD(msg, ##__VA_ARGS__); \
         } \
@@ -1559,7 +1654,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     do \
     { \
         const auto __hrRet = wil::verify_hresult(hr); \
-        if (FAILED(__hrRet)) \
+        if (FAILED(__hrRet)) __WI_UNLIKELY \
         { \
             __RETURN_HR_FAIL_NOFILE(__hrRet, #hr); \
         } \
@@ -1567,7 +1662,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __WIL_PRIVATE_RETURN_HR_IF(hr, cond) \
     do \
     { \
-        if (wil::verify_bool(cond)) \
+        if (wil::verify_bool(cond)) __WI_UNLIKELY \
         { \
             __RETURN_HR_NOFILE(wil::verify_hresult(hr), #cond); \
         } \
@@ -1575,7 +1670,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __WIL_PRIVATE_RETURN_LAST_ERROR_IF(cond) \
     do \
     { \
-        if (wil::verify_bool(cond)) \
+        if (wil::verify_bool(cond)) __WI_UNLIKELY \
         { \
             __RETURN_GLE_FAIL_NOFILE(#cond); \
         } \
@@ -1584,7 +1679,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
     do \
     { \
         const BOOL __boolRet = wil::verify_BOOL(win32BOOL); \
-        if (!__boolRet) \
+        if (!__boolRet) __WI_UNLIKELY \
         { \
             __RETURN_GLE_FAIL_NOFILE(#win32BOOL); \
         } \
@@ -1592,7 +1687,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __WIL_PRIVATE_RETURN_LAST_ERROR_IF_NULL(ptr) \
     do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_GLE_FAIL_NOFILE(#ptr); \
         } \
@@ -1600,7 +1695,7 @@ WI_ODR_PRAGMA("WIL_FreeMemory", "0")
 #define __WIL_PRIVATE_RETURN_IF_NULL_ALLOC(ptr) \
     do \
     { \
-        if ((ptr) == nullptr) \
+        if ((ptr) == nullptr) __WI_UNLIKELY \
         { \
             __RETURN_HR_FAIL_NOFILE(E_OUTOFMEMORY, #ptr); \
         } \
@@ -2258,7 +2353,7 @@ namespace details
 #define __FAIL_FAST_ASSERT__(condition) \
     do \
     { \
-        if (!(condition)) \
+        if (!(condition)) __WI_UNLIKELY \
         { \
             __RFF_FN(FailFast_Unexpected)(__RFF_INFO_ONLY(#condition)); \
         } \
@@ -2266,7 +2361,7 @@ namespace details
 #define __FAIL_FAST_IMMEDIATE_ASSERT__(condition) \
     do \
     { \
-        if (!(condition)) \
+        if (!(condition)) __WI_UNLIKELY \
         { \
             wil::FailureInfo failure{}; \
             wil::details::WilFailFast(failure); \
@@ -2421,7 +2516,23 @@ namespace details
     // A small mimic of the STL shared_ptr class, but unlike shared_ptr, a pointer is not attached to the class, but is
     // always simply contained within (it cannot be attached or detached).
 
-    template <typename object_t>
+    struct default_shared_object_allocator
+    {
+        template <typename value_t, typename... args_t>
+        static value_t* Create(args_t&&... args)
+        {
+#pragma warning(suppress: 26402) // shared_object takes ownership of this allocation.
+            return new (std::nothrow) value_t(wistd::forward<args_t>(args)...);
+        }
+
+        template <typename value_t>
+        static void Destroy(value_t* value) WI_NOEXCEPT
+        {
+            delete value;
+        }
+    };
+
+    template <typename object_t, typename allocator_t = default_shared_object_allocator>
     class shared_object
     {
     public:
@@ -2478,7 +2589,7 @@ namespace details
             {
                 if (0 == ::InterlockedDecrementRelease(&m_pCopy->m_refCount))
                 {
-                    delete m_pCopy;
+                    allocator_t::Destroy(m_pCopy);
                 }
                 m_pCopy = nullptr;
             }
@@ -2486,7 +2597,7 @@ namespace details
 
         bool create()
         {
-            RefAndObject* pObject = new (std::nothrow) RefAndObject();
+            RefAndObject* pObject = allocator_t::template Create<RefAndObject>();
             if (pObject == nullptr)
             {
                 return false;
@@ -2499,7 +2610,7 @@ namespace details
         template <typename param_t>
         bool create(param_t&& param1)
         {
-            RefAndObject* pObject = new (std::nothrow) RefAndObject(wistd::forward<param_t>(param1));
+            RefAndObject* pObject = allocator_t::template Create<RefAndObject>(wistd::forward<param_t>(param1));
             if (pObject == nullptr)
             {
                 return false;
@@ -3573,7 +3684,7 @@ _Always_(_Post_satisfies_(return < 0)) __declspec(noinline) inline HRESULT Resul
     {
         hr = details::g_pfnResultFromCaughtExceptionInternal(nullptr, 0, &isNormalized).hr;
     }
-    if (FAILED(hr))
+    if (FAILED(hr)) __WI_UNLIKELY
     {
         return hr;
     }
@@ -3683,7 +3794,7 @@ namespace details
             wchar_t message[2048]{};
             bool ignored;
             auto hr = g_pfnResultFromCaughtException_CppWinRt(message, ARRAYSIZE(message), &ignored);
-            if (FAILED(hr))
+            if (FAILED(hr)) __WI_UNLIKELY
             {
                 ReportFailure_Base<FailureType::Log>(__R_DIAGNOSTICS_RA(diagnostics, returnAddress), ResultStatus::FromResult(hr), message);
                 return hr;
@@ -3814,7 +3925,7 @@ namespace details
             catch (...)
             {
                 auto hr = RecognizeCaughtExceptionFromCallback(debugString, debugStringChars);
-                if (FAILED(hr))
+                if (FAILED(hr)) __WI_UNLIKELY
                 {
                     return hr;
                 }
@@ -3892,7 +4003,7 @@ namespace details
             catch (...)
             {
                 auto hr = ResultFromKnownException_CppWinRT(diagnostics, returnAddress);
-                if (FAILED(hr))
+                if (FAILED(hr)) __WI_UNLIKELY
                 {
                     return hr;
                 }
@@ -3982,7 +4093,7 @@ namespace details
         if (details::g_pfnResultFromCaughtException_CppWinRt != nullptr)
         {
             const auto hr = details::g_pfnResultFromCaughtException_CppWinRt(debugString, debugStringChars, isNormalized);
-            if (FAILED(hr))
+            if (FAILED(hr)) __WI_UNLIKELY
             {
                 return ResultStatus::FromResult(hr);
             }
@@ -4014,7 +4125,7 @@ namespace details
             catch (...)
             {
                 auto hr = RecognizeCaughtExceptionFromCallback(debugString, debugStringChars);
-                if (FAILED(hr))
+                if (FAILED(hr)) __WI_UNLIKELY
                 {
                     return ResultStatus::FromResult(hr);
                 }
@@ -4091,7 +4202,7 @@ namespace details
             catch (...)
             {
                 auto hr = ResultFromKnownException_CppWinRT(diagnostics, returnAddress);
-                if (FAILED(hr))
+                if (FAILED(hr)) __WI_UNLIKELY
                 {
                     return hr;
                 }
@@ -5478,7 +5589,7 @@ namespace details
         // Should be decorated WI_NOEXCEPT, but conflicts with forceinline.
         _Post_satisfies_(return == hr) __R_CONDITIONAL_METHOD(HRESULT, Log_IfFailed)(__R_CONDITIONAL_FN_PARAMS HRESULT hr)
         {
-            if (FAILED(hr))
+            if (FAILED(hr)) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -5515,7 +5626,7 @@ namespace details
         // Should be decorated WI_NOEXCEPT, but conflicts with forceinline.
         _Post_satisfies_(return == ret) __R_CONDITIONAL_METHOD(BOOL, Log_IfWin32BoolFalse)(__R_CONDITIONAL_FN_PARAMS BOOL ret)
         {
-            if (!ret)
+            if (!ret) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5525,7 +5636,7 @@ namespace details
         // Should be decorated WI_NOEXCEPT, but conflicts with forceinline.
         _Post_satisfies_(return == err) __R_CONDITIONAL_METHOD(DWORD, Log_IfWin32Error)(__R_CONDITIONAL_FN_PARAMS DWORD err)
         {
-            if (FAILED_WIN32(err))
+            if (FAILED_WIN32(err)) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_Win32)(__R_CONDITIONAL_FN_CALL err);
             }
@@ -5535,7 +5646,7 @@ namespace details
         // Should be decorated WI_NOEXCEPT, but conflicts with forceinline.
         _Post_satisfies_(return == handle) __R_CONDITIONAL_METHOD(HANDLE, Log_IfHandleInvalid)(__R_CONDITIONAL_FN_PARAMS HANDLE handle)
         {
-            if (handle == INVALID_HANDLE_VALUE)
+            if (handle == INVALID_HANDLE_VALUE) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5545,7 +5656,7 @@ namespace details
         // Should be decorated WI_NOEXCEPT, but conflicts with forceinline.
         _Post_satisfies_(return == handle) __R_CONDITIONAL_METHOD(HANDLE, Log_IfHandleNull)(__R_CONDITIONAL_FN_PARAMS HANDLE handle)
         {
-            if (handle == nullptr)
+            if (handle == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5556,7 +5667,7 @@ namespace details
         _Post_satisfies_(return == pointer)
             __R_CONDITIONAL_TEMPLATE_METHOD(PointerT, Log_IfNullAlloc)(__R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer) WI_NOEXCEPT
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_NullAlloc)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5566,7 +5677,7 @@ namespace details
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __R_CONDITIONAL_TEMPLATE_METHOD(void, Log_IfNullAlloc)(__R_CONDITIONAL_FN_PARAMS const PointerT& pointer) WI_NOEXCEPT
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_NullAlloc)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5575,7 +5686,7 @@ namespace details
         // Should be decorated WI_NOEXCEPT, but conflicts with forceinline.
         _Post_satisfies_(return == condition) __R_CONDITIONAL_METHOD(bool, Log_HrIf)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition)
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -5586,7 +5697,7 @@ namespace details
         _Post_satisfies_(return == condition)
             __R_CONDITIONAL_METHOD(bool, Log_HrIfFalse)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition)
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -5597,7 +5708,7 @@ namespace details
         _Post_satisfies_(return == pointer)
             __R_CONDITIONAL_TEMPLATE_METHOD(PointerT, Log_HrIfNull)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, _Pre_maybenull_ PointerT pointer) WI_NOEXCEPT
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -5607,7 +5718,7 @@ namespace details
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __R_CONDITIONAL_TEMPLATE_METHOD(void, Log_HrIfNull)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, _In_opt_ const PointerT& pointer) WI_NOEXCEPT
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -5616,7 +5727,7 @@ namespace details
         // Should be decorated WI_NOEXCEPT, but conflicts with forceinline.
         _Post_satisfies_(return == condition) __R_CONDITIONAL_METHOD(bool, Log_GetLastErrorIf)(__R_CONDITIONAL_FN_PARAMS bool condition)
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5627,7 +5738,7 @@ namespace details
         _Post_satisfies_(return == condition)
             __R_CONDITIONAL_METHOD(bool, Log_GetLastErrorIfFalse)(__R_CONDITIONAL_FN_PARAMS bool condition)
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5638,7 +5749,7 @@ namespace details
         _Post_satisfies_(return == pointer)
             __R_CONDITIONAL_TEMPLATE_METHOD(PointerT, Log_GetLastErrorIfNull)(__R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer) WI_NOEXCEPT
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5648,7 +5759,7 @@ namespace details
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __R_CONDITIONAL_TEMPLATE_METHOD(void, Log_GetLastErrorIfNull)(__R_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer) WI_NOEXCEPT
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -5658,7 +5769,7 @@ namespace details
         _Post_satisfies_(return == status)
             __R_CONDITIONAL_METHOD(NTSTATUS, Log_IfNtStatusFailed)(__R_CONDITIONAL_FN_PARAMS NTSTATUS status)
         {
-            if (FAILED_NTSTATUS(status))
+            if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Log_NtStatus)(__R_CONDITIONAL_FN_CALL status);
             }
@@ -5947,6 +6058,244 @@ namespace details
             }
             return status;
         }
+
+#if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
+        // The conditional methods of the LOG_XXX_MSG macros when RESULT_LAZY_MESSAGE_ARGUMENTS is 1. 'format' is the
+        // lambda of the macro (see __WI_MSG_ARGS), which the method calls only when the check fails, with a reporter:
+        // the lambda then evaluates the format string and its arguments and passes them to the reporter, which passes
+        // them on, with the diagnostics, to an internal method that takes them as var-args. A reporter is the lambda
+        // of a ...Reporter function below, which does not depend on the macro's lambda, so that the uses of the
+        // macros share its call operators (which compiles faster). It captures by value: by reference, PREfast would
+        // assume that the parameters of the conditional method may change, and could not prove its _Post_satisfies_
+        // annotation. It tests 'failed', always true, so that neither lambda is a function that never returns:
+        // compilers do not inline a call to one (the call is cold), which would leave both lambdas out of line at
+        // each use of a FAIL_FAST_ or THROW_ macro, and the variables they capture in memory. Once the lambdas are
+        // inlined, the test folds away.
+        __R_INTERNAL_METHOD(_Log_HrMsgLazy)
+        (__R_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            wil::details::ReportFailure_HrMsg<FailureType::Log>(__R_INTERNAL_FN_CALL hr, formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_HrMsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS HRESULT hr, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Log_HrMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL hr, formatString, args...);
+                }
+            };
+        }
+
+        __R_INTERNAL_METHOD(_Log_GetLastErrorMsgLazy)
+        (__R_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            ::SetLastError(lastError); // The message arguments ran after the conditional method read it
+            wil::details::ReportFailure_GetLastErrorMsg<FailureType::Log>(__R_INTERNAL_FN_CALL formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_GetLastErrorMsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS DWORD lastError, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Log_GetLastErrorMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL lastError, formatString, args...);
+                }
+            };
+        }
+
+        __R_INTERNAL_METHOD(_Log_Win32MsgLazy)
+        (__R_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            wil::details::ReportFailure_Win32Msg<FailureType::Log>(__R_INTERNAL_FN_CALL err, formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_Win32MsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS DWORD err, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Log_Win32MsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL err, formatString, args...);
+                }
+            };
+        }
+
+        __R_INTERNAL_METHOD(_Log_NtStatusMsgLazy)
+        (__R_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            wil::details::ReportFailure_NtStatusMsg<FailureType::Log>(__R_INTERNAL_FN_CALL status, formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Log_NtStatusMsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS NTSTATUS status, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Log_NtStatusMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL status, formatString, args...);
+                }
+            };
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == hr)
+            __R_CONDITIONAL_TEMPLATE_METHOD(HRESULT, Log_IfFailedMsg)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, const TFormat& format) WI_NOEXCEPT
+        {
+            if (FAILED(hr)) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+            }
+            return hr;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == ret)
+            __R_CONDITIONAL_TEMPLATE_METHOD(BOOL, Log_IfWin32BoolFalseMsg)(__R_CONDITIONAL_FN_PARAMS BOOL ret, const TFormat& format) WI_NOEXCEPT
+        {
+            if (!ret) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+            }
+            return ret;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == err)
+            __R_CONDITIONAL_TEMPLATE_METHOD(DWORD, Log_IfWin32ErrorMsg)(__R_CONDITIONAL_FN_PARAMS DWORD err, const TFormat& format) WI_NOEXCEPT
+        {
+            if (FAILED_WIN32(err)) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_Win32MsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL err, true));
+            }
+            return err;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) __R_CONDITIONAL_TEMPLATE_METHOD(PointerT, Log_IfNullAllocMsg)(
+            __R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+            }
+            return pointer;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __R_CONDITIONAL_TEMPLATE_METHOD(void, Log_IfNullAllocMsg)(__R_CONDITIONAL_FN_PARAMS const PointerT& pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+            }
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition)
+            __R_CONDITIONAL_TEMPLATE_METHOD(bool, Log_HrIfMsg)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition, const TFormat& format) WI_NOEXCEPT
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+            }
+            return condition;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) __R_CONDITIONAL_TEMPLATE_METHOD(PointerT, Log_HrIfNullMsg)(
+            __R_CONDITIONAL_FN_PARAMS HRESULT hr, _Pre_maybenull_ PointerT pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+            }
+            return pointer;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __R_CONDITIONAL_TEMPLATE_METHOD(void, Log_HrIfNullMsg)(
+            __R_CONDITIONAL_FN_PARAMS HRESULT hr, _In_opt_ const PointerT& pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+            }
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition)
+            __R_CONDITIONAL_TEMPLATE_METHOD(bool, Log_GetLastErrorIfMsg)(__R_CONDITIONAL_FN_PARAMS bool condition, const TFormat& format) WI_NOEXCEPT
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+            }
+            return condition;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) __R_CONDITIONAL_TEMPLATE_METHOD(PointerT, Log_GetLastErrorIfNullMsg)(
+            __R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+            }
+            return pointer;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __R_CONDITIONAL_TEMPLATE_METHOD(void, Log_GetLastErrorIfNullMsg)(
+            __R_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+            }
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == status)
+            __R_CONDITIONAL_TEMPLATE_METHOD(NTSTATUS, Log_IfNtStatusFailedMsg)(__R_CONDITIONAL_FN_PARAMS NTSTATUS status, const TFormat& format) WI_NOEXCEPT
+        {
+            if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Log_NtStatusMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL status, true));
+            }
+            return status;
+        }
+#endif // RESULT_LAZY_MESSAGE_ARGUMENTS
     } // namespace __R_NS_NAME
 
     namespace __RFF_NS_NAME
@@ -6020,7 +6369,7 @@ namespace details
         _Post_satisfies_(return == hr) _When_(FAILED(hr), _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(HRESULT, FailFast_IfFailed)(__RFF_CONDITIONAL_FN_PARAMS HRESULT hr) WI_NOEXCEPT
         {
-            if (FAILED(hr))
+            if (FAILED(hr)) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Hr)(__RFF_CONDITIONAL_FN_CALL hr);
             }
@@ -6030,7 +6379,7 @@ namespace details
         _Post_satisfies_(return == ret) _When_(!ret, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(BOOL, FailFast_IfWin32BoolFalse)(__RFF_CONDITIONAL_FN_PARAMS BOOL ret) WI_NOEXCEPT
         {
-            if (!ret)
+            if (!ret) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastError)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6041,7 +6390,7 @@ namespace details
         _Post_satisfies_(return == err) _When_(FAILED_WIN32(err), _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(DWORD, FailFast_IfWin32Error)(__RFF_CONDITIONAL_FN_PARAMS DWORD err)
         {
-            if (FAILED_WIN32(err))
+            if (FAILED_WIN32(err)) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Win32)(__RFF_CONDITIONAL_FN_CALL err);
             }
@@ -6051,7 +6400,7 @@ namespace details
         _Post_satisfies_(return == handle) _When_(handle == INVALID_HANDLE_VALUE, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(HANDLE, FailFast_IfHandleInvalid)(__RFF_CONDITIONAL_FN_PARAMS HANDLE handle) WI_NOEXCEPT
         {
-            if (handle == INVALID_HANDLE_VALUE)
+            if (handle == INVALID_HANDLE_VALUE) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastError)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6062,7 +6411,7 @@ namespace details
         __RFF_CONDITIONAL_METHOD(RESULT_NORETURN_NULL HANDLE, FailFast_IfHandleNull)
         (__RFF_CONDITIONAL_FN_PARAMS HANDLE handle) WI_NOEXCEPT
         {
-            if (handle == nullptr)
+            if (handle == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastError)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6075,7 +6424,7 @@ namespace details
         __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_IfNullAlloc)
         (__RFF_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_NullAlloc)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6086,7 +6435,7 @@ namespace details
         template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_IfNullAlloc)(__RFF_CONDITIONAL_FN_PARAMS const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_NullAlloc)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6095,7 +6444,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFast_HrIf)(__RFF_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition) WI_NOEXCEPT
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Hr)(__RFF_CONDITIONAL_FN_CALL hr);
             }
@@ -6105,7 +6454,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(!condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFast_HrIfFalse)(__RFF_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition) WI_NOEXCEPT
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Hr)(__RFF_CONDITIONAL_FN_CALL hr);
             }
@@ -6118,7 +6467,7 @@ namespace details
         __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_HrIfNull)
         (__RFF_CONDITIONAL_FN_PARAMS HRESULT hr, _Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Hr)(__RFF_CONDITIONAL_FN_CALL hr);
             }
@@ -6129,7 +6478,7 @@ namespace details
         template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_HrIfNull)(__RFF_CONDITIONAL_FN_PARAMS HRESULT hr, _In_opt_ const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Hr)(__RFF_CONDITIONAL_FN_CALL hr);
             }
@@ -6138,7 +6487,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFast_GetLastErrorIf)(__RFF_CONDITIONAL_FN_PARAMS bool condition) WI_NOEXCEPT
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastError)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6148,7 +6497,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(!condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFast_GetLastErrorIfFalse)(__RFF_CONDITIONAL_FN_PARAMS bool condition) WI_NOEXCEPT
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastError)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6161,7 +6510,7 @@ namespace details
         __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_GetLastErrorIfNull)
         (__RFF_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastError)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6172,7 +6521,7 @@ namespace details
         template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_GetLastErrorIfNull)(__RFF_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastError)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6181,7 +6530,7 @@ namespace details
         _Post_satisfies_(return == status) _When_(FAILED_NTSTATUS(status), _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(NTSTATUS, FailFast_IfNtStatusFailed)(__RFF_CONDITIONAL_FN_PARAMS NTSTATUS status) WI_NOEXCEPT
         {
-            if (FAILED_NTSTATUS(status))
+            if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_NtStatus)(__RFF_CONDITIONAL_FN_CALL status);
             }
@@ -6509,7 +6858,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFast_If)(__RFF_CONDITIONAL_FN_PARAMS bool condition) WI_NOEXCEPT
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Unexpected)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6519,7 +6868,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(!condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFast_IfFalse)(__RFF_CONDITIONAL_FN_PARAMS bool condition) WI_NOEXCEPT
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Unexpected)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6532,7 +6881,7 @@ namespace details
         __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_IfNull)
         (__RFF_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Unexpected)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6544,7 +6893,7 @@ namespace details
         __WI_SUPPRESS_NULLPTR_ANALYSIS __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_IfNull)(
             __RFF_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFast_Unexpected)(__RFF_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6622,6 +6971,302 @@ namespace details
             }
         }
 
+#if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
+        // The conditional methods of the FAIL_FAST_XXX_MSG macros when RESULT_LAZY_MESSAGE_ARGUMENTS is 1: see those of the
+        // LOG_XXX_MSG macros above.
+        __RFF_INTERNAL_NORET_METHOD(_FailFast_HrMsgLazy)
+        (__RFF_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __RFF_FN_LOCALS;
+            wil::details::ReportFailure_HrMsg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL hr, formatString, argList);
+        }
+
+        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_HrMsgLazyReporter)
+        (__RFF_INTERNAL_FN_PARAMS HRESULT hr, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __RFF_CALL_INTERNAL_METHOD(_FailFast_HrMsgLazy)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, formatString, args...);
+                }
+            };
+        }
+
+        __RFF_INTERNAL_NORET_METHOD(_FailFast_GetLastErrorMsgLazy)
+        (__RFF_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __RFF_FN_LOCALS;
+            ::SetLastError(lastError); // The message arguments ran after the conditional method read it
+            wil::details::ReportFailure_GetLastErrorMsg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL formatString, argList);
+        }
+
+        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_GetLastErrorMsgLazyReporter)
+        (__RFF_INTERNAL_FN_PARAMS DWORD lastError, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __RFF_CALL_INTERNAL_METHOD(_FailFast_GetLastErrorMsgLazy)(
+                        __RFF_CONDITIONAL_LAZY_FN_CALL lastError, formatString, args...);
+                }
+            };
+        }
+
+        __RFF_INTERNAL_NORET_METHOD(_FailFast_Win32MsgLazy)
+        (__RFF_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __RFF_FN_LOCALS;
+            wil::details::ReportFailure_Win32Msg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL err, formatString, argList);
+        }
+
+        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_Win32MsgLazyReporter)
+        (__RFF_INTERNAL_FN_PARAMS DWORD err, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __RFF_CALL_INTERNAL_METHOD(_FailFast_Win32MsgLazy)(__RFF_CONDITIONAL_LAZY_FN_CALL err, formatString, args...);
+                }
+            };
+        }
+
+        __RFF_INTERNAL_NORET_METHOD(_FailFast_NtStatusMsgLazy)
+        (__RFF_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...) WI_NOEXCEPT
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __RFF_FN_LOCALS;
+            wil::details::ReportFailure_NtStatusMsg<FailureType::FailFast>(__RFF_INTERNAL_FN_CALL status, formatString, argList);
+        }
+
+        __RFF_CONDITIONAL_INLINE_METHOD(auto, _FailFast_NtStatusMsgLazyReporter)
+        (__RFF_INTERNAL_FN_PARAMS NTSTATUS status, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __RFF_CALL_INTERNAL_METHOD(_FailFast_NtStatusMsgLazy)(__RFF_CONDITIONAL_LAZY_FN_CALL status, formatString, args...);
+                }
+            };
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == hr) _When_(FAILED(hr), _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(HRESULT, FailFast_IfFailedMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS HRESULT hr, const TFormat& format) WI_NOEXCEPT
+        {
+            if (FAILED(hr)) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return hr;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == ret) _When_(!ret, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(BOOL, FailFast_IfWin32BoolFalseMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS BOOL ret, const TFormat& format) WI_NOEXCEPT
+        {
+            if (!ret) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
+                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return ret;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == err) _When_(FAILED_WIN32(err), _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(DWORD, FailFast_IfWin32ErrorMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS DWORD err, const TFormat& format) WI_NOEXCEPT
+        {
+            if (FAILED_WIN32(err)) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_Win32MsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL err, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return err;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) _When_(pointer == nullptr, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_IfNullAllocMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return pointer;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_IfNullAllocMsg)(
+            __RFF_CONDITIONAL_FN_PARAMS const PointerT& pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(bool, FailFast_HrIfMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition, const TFormat& format) WI_NOEXCEPT
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return condition;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) _When_(pointer == nullptr, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_HrIfNullMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS HRESULT hr, _Pre_maybenull_ PointerT pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return pointer;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_HrIfNullMsg)(
+            __RFF_CONDITIONAL_FN_PARAMS HRESULT hr, _In_opt_ const PointerT& pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(bool, FailFast_GetLastErrorIfMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS bool condition, const TFormat& format) WI_NOEXCEPT
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
+                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return condition;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) _When_(pointer == nullptr, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_GetLastErrorIfNullMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
+                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return pointer;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_GetLastErrorIfNullMsg)(
+            __RFF_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_GetLastErrorMsgLazyReporter)(
+                    __RFF_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == status) _When_(FAILED_NTSTATUS(status), _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(NTSTATUS, FailFast_IfNtStatusFailedMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS NTSTATUS status, const TFormat& format) WI_NOEXCEPT
+        {
+            if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_NtStatusMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL status, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return status;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(bool, FailFast_IfMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS bool condition, const TFormat& format) WI_NOEXCEPT
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return condition;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) _When_(pointer == nullptr, _Analysis_noreturn_)
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFast_IfNullMsg)
+        (__RFF_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return pointer;
+        }
+
+        template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFast_IfNullMsg)(
+            __RFF_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer, const TFormat& format) WI_NOEXCEPT
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __RFF_CONDITIONAL_LAZY_LOCALS;
+                format(__RFF_CALL_INTERNAL_INLINE_METHOD(_FailFast_HrMsgLazyReporter)(__RFF_CONDITIONAL_LAZY_FN_CALL E_UNEXPECTED, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+        }
+#endif // RESULT_LAZY_MESSAGE_ARGUMENTS
+
         //*****************************************************************************
         // FailFast Immediate Macros
         //*****************************************************************************
@@ -6639,7 +7284,7 @@ namespace details
         _Post_satisfies_(return == hr) _When_(FAILED(hr), _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(HRESULT, FailFastImmediate_IfFailed)(HRESULT hr) WI_NOEXCEPT
         {
-            if (FAILED(hr))
+            if (FAILED(hr)) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFastImmediate_Unexpected)();
             }
@@ -6649,7 +7294,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFastImmediate_If)(bool condition) WI_NOEXCEPT
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFastImmediate_Unexpected)();
             }
@@ -6659,7 +7304,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(!condition, _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(bool, FailFastImmediate_IfFalse)(bool condition) WI_NOEXCEPT
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFastImmediate_Unexpected)();
             }
@@ -6672,7 +7317,7 @@ namespace details
         __RFF_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, FailFastImmediate_IfNull)
         (_Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFastImmediate_Unexpected)();
             }
@@ -6683,7 +7328,7 @@ namespace details
         template <__RFF_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __RFF_CONDITIONAL_TEMPLATE_METHOD(void, FailFastImmediate_IfNull)(_In_opt_ const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFastImmediate_Unexpected)();
             }
@@ -6692,7 +7337,7 @@ namespace details
         _Post_satisfies_(return == status) _When_(FAILED_NTSTATUS(status), _Analysis_noreturn_)
         __RFF_CONDITIONAL_METHOD(NTSTATUS, FailFastImmediate_IfNtStatusFailed)(NTSTATUS status) WI_NOEXCEPT
         {
-            if (FAILED_NTSTATUS(status))
+            if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
             {
                 __RFF_CALL_INTERNAL_METHOD(_FailFastImmediate_Unexpected)();
             }
@@ -6770,7 +7415,7 @@ namespace details
         _Post_satisfies_(return == hr) _When_(FAILED(hr), _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(HRESULT, Throw_IfFailed)(__R_CONDITIONAL_FN_PARAMS HRESULT hr)
         {
-            if (FAILED(hr))
+            if (FAILED(hr)) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -6780,7 +7425,7 @@ namespace details
         _Post_satisfies_(return == ret) _When_(!ret, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(BOOL, Throw_IfWin32BoolFalse)(__R_CONDITIONAL_FN_PARAMS BOOL ret)
         {
-            if (!ret)
+            if (!ret) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6790,7 +7435,7 @@ namespace details
         _Post_satisfies_(return == err) _When_(FAILED_WIN32(err), _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(DWORD, Throw_IfWin32Error)(__R_CONDITIONAL_FN_PARAMS DWORD err)
         {
-            if (FAILED_WIN32(err))
+            if (FAILED_WIN32(err)) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_Win32)(__R_CONDITIONAL_FN_CALL err);
             }
@@ -6800,7 +7445,7 @@ namespace details
         _Post_satisfies_(return == handle) _When_(handle == INVALID_HANDLE_VALUE, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(HANDLE, Throw_IfHandleInvalid)(__R_CONDITIONAL_FN_PARAMS HANDLE handle)
         {
-            if (handle == INVALID_HANDLE_VALUE)
+            if (handle == INVALID_HANDLE_VALUE) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6810,7 +7455,7 @@ namespace details
         _Post_satisfies_(return == handle) _When_(handle == nullptr, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(RESULT_NORETURN_NULL HANDLE, Throw_IfHandleNull)(__R_CONDITIONAL_FN_PARAMS HANDLE handle)
         {
-            if (handle == nullptr)
+            if (handle == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6822,7 +7467,7 @@ namespace details
         __R_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, Throw_IfNullAlloc)
         (__R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_NullAlloc)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6832,7 +7477,7 @@ namespace details
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __R_CONDITIONAL_TEMPLATE_METHOD(void, Throw_IfNullAlloc)(__R_CONDITIONAL_FN_PARAMS const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_NullAlloc)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6841,7 +7486,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(bool, Throw_HrIf)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition)
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -6851,7 +7496,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(!condition, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(bool, Throw_HrIfFalse)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition)
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -6863,7 +7508,7 @@ namespace details
         __R_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, Throw_HrIfNull)
         (__R_CONDITIONAL_FN_PARAMS HRESULT hr, _Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -6873,7 +7518,7 @@ namespace details
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __R_CONDITIONAL_TEMPLATE_METHOD(void, Throw_HrIfNull)(__R_CONDITIONAL_FN_PARAMS HRESULT hr, _In_opt_ const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_Hr)(__R_CONDITIONAL_FN_CALL hr);
             }
@@ -6882,7 +7527,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(bool, Throw_Win32If)(__R_CONDITIONAL_FN_PARAMS DWORD err, bool condition)
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_Win32)(__R_CONDITIONAL_FN_CALL err);
             }
@@ -6892,7 +7537,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(bool, Throw_GetLastErrorIf)(__R_CONDITIONAL_FN_PARAMS bool condition)
         {
-            if (condition)
+            if (condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6902,7 +7547,7 @@ namespace details
         _Post_satisfies_(return == condition) _When_(!condition, _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(bool, Throw_GetLastErrorIfFalse)(__R_CONDITIONAL_FN_PARAMS bool condition)
         {
-            if (!condition)
+            if (!condition) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6914,7 +7559,7 @@ namespace details
         __R_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, Throw_GetLastErrorIfNull)
         (__R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6924,7 +7569,7 @@ namespace details
         template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, __R_ENABLE_IF_IS_CLASS(PointerT)>
         __R_CONDITIONAL_TEMPLATE_METHOD(void, Throw_GetLastErrorIfNull)(__R_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer)
         {
-            if (pointer == nullptr)
+            if (pointer == nullptr) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_GetLastError)(__R_CONDITIONAL_FN_CALL_ONLY);
             }
@@ -6933,7 +7578,7 @@ namespace details
         _Post_satisfies_(return == status) _When_(FAILED_NTSTATUS(status), _Analysis_noreturn_)
         __R_CONDITIONAL_METHOD(NTSTATUS, Throw_IfNtStatusFailed)(__R_CONDITIONAL_FN_PARAMS NTSTATUS status)
         {
-            if (FAILED_NTSTATUS(status))
+            if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
             {
                 __R_CALL_INTERNAL_METHOD(_Throw_NtStatus)(__R_CONDITIONAL_FN_CALL status);
             }
@@ -7245,6 +7890,274 @@ namespace details
             }
             return status;
         }
+
+#if (RESULT_LAZY_MESSAGE_ARGUMENTS == 1)
+        // The conditional methods of the THROW_XXX_MSG macros when RESULT_LAZY_MESSAGE_ARGUMENTS is 1: see those of the
+        // LOG_XXX_MSG macros above.
+        __R_INTERNAL_NORET_METHOD(_Throw_HrMsgLazy)
+        (__R_INTERNAL_FN_PARAMS HRESULT hr, _Printf_format_string_ PCSTR formatString, ...)
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            wil::details::ReportFailure_HrMsg<FailureType::Exception>(__R_INTERNAL_FN_CALL hr, formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_HrMsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS HRESULT hr, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Throw_HrMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL hr, formatString, args...);
+                }
+            };
+        }
+
+        __R_INTERNAL_NORET_METHOD(_Throw_GetLastErrorMsgLazy)
+        (__R_INTERNAL_FN_PARAMS DWORD lastError, _Printf_format_string_ PCSTR formatString, ...)
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            ::SetLastError(lastError); // The message arguments ran after the conditional method read it
+            wil::details::ReportFailure_GetLastErrorMsg<FailureType::Exception>(__R_INTERNAL_FN_CALL formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_GetLastErrorMsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS DWORD lastError, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Throw_GetLastErrorMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL lastError, formatString, args...);
+                }
+            };
+        }
+
+        __R_INTERNAL_NORET_METHOD(_Throw_Win32MsgLazy)
+        (__R_INTERNAL_FN_PARAMS DWORD err, _Printf_format_string_ PCSTR formatString, ...)
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            wil::details::ReportFailure_Win32Msg<FailureType::Exception>(__R_INTERNAL_FN_CALL err, formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_Win32MsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS DWORD err, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Throw_Win32MsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL err, formatString, args...);
+                }
+            };
+        }
+
+        __R_INTERNAL_NORET_METHOD(_Throw_NtStatusMsgLazy)
+        (__R_INTERNAL_FN_PARAMS NTSTATUS status, _Printf_format_string_ PCSTR formatString, ...)
+        {
+            va_list argList;
+            va_start(argList, formatString);
+            __R_FN_LOCALS;
+            wil::details::ReportFailure_NtStatusMsg<FailureType::Exception>(__R_INTERNAL_FN_CALL status, formatString, argList);
+        }
+
+        __R_CONDITIONAL_INLINE_METHOD(auto, _Throw_NtStatusMsgLazyReporter)
+        (__R_INTERNAL_FN_PARAMS NTSTATUS status, bool failed) WI_NOEXCEPT
+        {
+            return [=](_Printf_format_string_ PCSTR formatString, const auto&... args) {
+                if (failed) // Always true; see above
+                {
+                    __R_CALL_INTERNAL_METHOD(_Throw_NtStatusMsgLazy)(__R_CONDITIONAL_LAZY_FN_CALL status, formatString, args...);
+                }
+            };
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == hr) _When_(FAILED(hr), _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(HRESULT, Throw_IfFailedMsg)
+        (__R_CONDITIONAL_FN_PARAMS HRESULT hr, const TFormat& format)
+        {
+            if (FAILED(hr)) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return hr;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == ret) _When_(!ret, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(BOOL, Throw_IfWin32BoolFalseMsg)
+        (__R_CONDITIONAL_FN_PARAMS BOOL ret, const TFormat& format)
+        {
+            if (!ret) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return ret;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == err) _When_(FAILED_WIN32(err), _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(DWORD, Throw_IfWin32ErrorMsg)
+        (__R_CONDITIONAL_FN_PARAMS DWORD err, const TFormat& format)
+        {
+            if (FAILED_WIN32(err)) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_Win32MsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL err, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return err;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) _When_(pointer == nullptr, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, Throw_IfNullAllocMsg)
+        (__R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer, const TFormat& format)
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return pointer;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __WI_SUPPRESS_NULLPTR_ANALYSIS _When_(pointer == nullptr, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(void, Throw_IfNullAllocMsg)
+        (__R_CONDITIONAL_FN_PARAMS const PointerT& pointer, const TFormat& format)
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL E_OUTOFMEMORY, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(bool, Throw_HrIfMsg)
+        (__R_CONDITIONAL_FN_PARAMS HRESULT hr, bool condition, const TFormat& format)
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return condition;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __WI_SUPPRESS_NULLPTR_ANALYSIS _Post_satisfies_(return == pointer) _When_(pointer == nullptr, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, Throw_HrIfNullMsg)
+        (__R_CONDITIONAL_FN_PARAMS HRESULT hr, _Pre_maybenull_ PointerT pointer, const TFormat& format)
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return pointer;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __WI_SUPPRESS_NULLPTR_ANALYSIS _When_(pointer == nullptr, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(void, Throw_HrIfNullMsg)
+        (__R_CONDITIONAL_FN_PARAMS HRESULT hr, _In_opt_ const PointerT& pointer, const TFormat& format)
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_HrMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL hr, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(bool, Throw_Win32IfMsg)
+        (__R_CONDITIONAL_FN_PARAMS DWORD err, bool condition, const TFormat& format)
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_Win32MsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL err, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return condition;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == condition) _When_(condition, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(bool, Throw_GetLastErrorIfMsg)
+        (__R_CONDITIONAL_FN_PARAMS bool condition, const TFormat& format)
+        {
+            if (condition) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return condition;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_NOT_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == pointer) _When_(pointer == nullptr, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(RESULT_NORETURN_NULL PointerT, Throw_GetLastErrorIfNullMsg)
+        (__R_CONDITIONAL_FN_PARAMS _Pre_maybenull_ PointerT pointer, const TFormat& format)
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return pointer;
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename PointerT, typename TFormat, __R_ENABLE_IF_IS_CLASS(PointerT), __R_ENABLE_IF_IS_CLASS(TFormat)>
+        __WI_SUPPRESS_NULLPTR_ANALYSIS _When_(pointer == nullptr, _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(void, Throw_GetLastErrorIfNullMsg)
+        (__R_CONDITIONAL_FN_PARAMS _In_opt_ const PointerT& pointer, const TFormat& format)
+        {
+            if (pointer == nullptr) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                const DWORD lastError = ::GetLastError(); // Before the message arguments, which may change it
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_GetLastErrorMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL lastError, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+        }
+
+        template <__R_CONDITIONAL_PARTIAL_TEMPLATE typename TFormat, __R_ENABLE_IF_IS_CLASS(TFormat)>
+        _Post_satisfies_(return == status) _When_(FAILED_NTSTATUS(status), _Analysis_noreturn_)
+        __R_CONDITIONAL_TEMPLATE_METHOD(NTSTATUS, Throw_IfNtStatusFailedMsg)
+        (__R_CONDITIONAL_FN_PARAMS NTSTATUS status, const TFormat& format)
+        {
+            if (FAILED_NTSTATUS(status)) __WI_UNLIKELY
+            {
+                __R_CONDITIONAL_LAZY_LOCALS;
+                format(__R_CALL_INTERNAL_INLINE_METHOD(_Throw_NtStatusMsgLazyReporter)(__R_CONDITIONAL_LAZY_FN_CALL status, true));
+                __WI_ANALYSIS_ASSUME(false); // The report above does not return (RESULT_NORETURN).
+            }
+            return status;
+        }
+#endif // RESULT_LAZY_MESSAGE_ARGUMENTS
 #endif // WIL_ENABLE_EXCEPTIONS
 
     } // namespace __R_NS_NAME

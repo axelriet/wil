@@ -12,8 +12,10 @@
 
 #include "mocking.h"
 
+// NOTE: The expression is only named inside the lambda, never in an unevaluated operand (decltype), since it may
+//       hold a lambda itself (the conditional _MSG macros), which C++ allows there only from C++20
 #define REPORTS_ERROR(expr) \
-    witest::ReportsError(wistd::is_same<HRESULT, decltype(expr)>{}, [&]() { \
+    witest::ReportsError([&]() { \
         return expr; \
     })
 #define REQUIRE_ERROR(expr) REQUIRE(REPORTS_ERROR(expr))
@@ -271,6 +273,12 @@ bool ReportsError(wistd::true_type, Lambda&& callOp)
 {
     // HRESULT; expect error code
     return FAILED(callOp());
+}
+
+template <typename Lambda>
+bool ReportsError(Lambda&& callOp)
+{
+    return ReportsError(wistd::is_same<HRESULT, decltype(callOp())>{}, wistd::forward<Lambda>(callOp));
 }
 
 #ifdef WIL_ENABLE_EXCEPTIONS
